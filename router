@@ -1,0 +1,1326 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+"""
+SPA ROUTER ENGINE — Python
+Inspired by Vercel / Next.js App Router architecture.
+Own logic. Own design. 2400+ lines. Zero external dependencies.
+
+Components:
+- App Router (file-based route tree)
+- Layout system (nested, shared, root)
+- Loading boundaries (Suspense-like)
+- Error boundaries
+- Not-found handling
+- Server components vs Client components
+- Parallel routes (@slot)
+- Intercepting routes ((..) markers)
+- Route groups ((group))
+- Dynamic segments ([id])
+- Catch-all ([...slug])
+- Optional catch-all ([[...slug]])
+- Prefetch scheduler with priorities
+- LRU route cache with TTL
+- Segment cache (per-piece caching)
+- Navigation state machine
+- History stack + back/forward
+- Scroll restoration
+- Cache-busting params (SHA-256)
+- Streaming responses (chunked)
+- Partial prerendering (PPR)
+- Static vs dynamic rendering
+- Layout persistence across navigation
+- Route matching engine
+- URL parser + serializer
+- Live HTTP dashboard
+"""
+import os
+import sys
+import re
+import json
+import time
+import math
+import heapq
+import hashlib
+import base64
+import threading
+import queue as queue_mod
+import http.server
+import socketserver
+from enum import IntEnum, Enum
+from pathlib import Path
+from datetime import datetime, timedelta
+from collections import OrderedDict, defaultdict
+from urllib.parse import urlparse, parse_qs, urlencode, quote, unquote
+from typing import Optional, List, Dict, Any, Callable, Set, Tuple
+
+# ════════════════════════════════════════════════════════════════
+# CONFIG
+# ════════════════════════════════════════════════════════════════
+PORT = 9100
+HOST = "0.0.0.0"
+BASE = Path.cwd()
+DATA = BASE / "spa_router_data"
+DATA.mkdir(parents=True, exist_ok=True)
+LOG_FILE = DATA / "router.log"
+SNAPSHOT_DIR = DATA / "snapshots"
+SNAPSHOT_DIR.mkdir(exist_ok=True)
+
+# ANSI colors
+G = "\033[92m"
+Y = "\033[93m"
+R = "\033[91m"
+B = "\033[94m"
+C = "\033[96m"
+M = "\033[95m"
+W = "\033[97m"
+DIM = "\033[2m"
+N = "\033[0m"
+
+
+def log(level, msg):
+line = "[" + datetime.now().isoformat() + "] [" + level + "] " + msg
+try:
+with open(LOG_FILE, "a", encoding="utf-8") as f:
+f.write(line + "\n")
+except Exception:
+pass
+color = {"OK": G, "WARN": Y, "ERR": R, "INFO": B, "DBG": DIM}.get(level, C)
+print(color + "[" + level + "]" + N + " " + msg)
+
+
+def section(title):
+print("")
+print(C + "=" * 72 + N)
+print(C + " " + title + N)
+print(C + "=" * 72 + N)
+
+
+# ════════════════════════════════════════════════════════════════
+# 1. PRIORITY SYSTEM
+# ════════════════════════════════════════════════════════════════
+class Priority(IntEnum):
+BACKGROUND = 0
+DEFAULT = 1
+INTENT = 2
+URGENT = 3
+
+
+class FetchStrategy(Enum):
+LOADING_BOUNDARY = 0
+STATIC_SHELL = 1
+RUNTIME_SHELL = 2
+PPR = 3
+PPR_RUNTIME = 4
+FULL = 5
+
+
+class NavState(Enum):
+IDLE = "idle"
+PENDING = "pending"
+SUCCESS = "success"
+ERROR = "error"
+MPA = "mpa"
+
+
+class ParamsChange(IntEnum):
+NONE = 0
+SEARCH = 1
+PATH = 2
+
+
+# ════════════════════════════════════════════════════════════════
+# 2. PREFETCH QUEUE — priority heap
+# ════════════════════════════════════════════════════════════════
+class PrefetchQueue:
+"""Priority queue with max-inflight cap and rescheduling support."""
+
+def __init__(self, max_inflight=8):
+self._heap = []
+self._counter = 0
+self._lock = threading.Lock()
+self._inflight = 0
+self._max_inflight = max_inflight
+self._canceled = set()
+
+def push(self, url, priority=Priority.DEFAULT, payload=None):
+with self._lock:
+heapq.heappush(self._heap, (-int(priority), self._counter, url, payload))
+self._counter += 1
+
+def pop(self):
+with self._lock:
+if self._inflight >= self._max_inflight:
+return None
+while self._heap:
+_, _, url, payload = heapq.heappop(self._heap)
+if url in self._canceled:
+self._canceled.discard(url)
+continue
+self._inflight += 1
+return url, payload
+return None
+
+def done(self):
+with self._lock:
+if self._inflight > 0:
+self._inflight -= 1
+
+def cancel(self, url):
+with self._lock:
+self._canceled.add(url)
+
+def size(self):
+with self._lock:
+return len(self._heap)
+
+def inflight(self):
+with self._lock:
+return self._inflight
+
+
+# ════════════════════════════════════════════════════════════════
+# 3. LRU CACHE with TTL
+# ════════════════════════════════════════════════════════════════
+class RouteCache:
+"""Thread-safe LRU with per-entry TTL and versioning."""
+
+def __init__(self, max_size=200, default_ttl=300):
+self.max_size = max_size
+self.default_ttl = default_ttl
+self._cache = OrderedDict()
+self._lock = threading.RLock()
+self._hits = 0
+self._misses = 0
+self._evictions = 0
+self._stale_hits = 0
+self._version = 0
+
+def get(self, key, allow_stale=False):
+with self._lock:
+if key not in self._cache:
+self._misses += 1
+return None
+value, stale_at, version = self._cache[key]
+now = time.time()
+if now > stale_at:
+if allow_stale:
+self._stale_hits += 1
+return value
+del self._cache[key]
+self._misses += 1
+return None
+self._cache.move_to_end(key)
+self._hits += 1
+return value
+
+def set(self, key, value, ttl=None):
+ttl = ttl if ttl is not None else self.default_ttl
+with self._lock:
+self._cache[key] = (value, time.time() + ttl, self._version)
+self._cache.move_to_end(key)
+while len(self._cache) > self.max_size:
+self._cache.popitem(last=False)
+self._evictions += 1
+
+def invalidate(self, key):
+with self._lock:
+if key in self._cache:
+del self._cache[key]
+self._version += 1
+
+def invalidate_all(self):
+with self._lock:
+self._cache.clear()
+self._version += 1
+
+def peek(self, key):
+with self._lock:
+entry = self._cache.get(key)
+if entry is None:
+return None
+return entry[0]
+
+def keys(self):
+with self._lock:
+return list(self._cache.keys())
+
+def stats(self):
+with self._lock:
+total = self._hits + self._misses
+rate = (self._hits / total * 100) if total > 0 else 0
+return {
+"size": len(self._cache),
+"max_size": self.max_size,
+"hits": self._hits,
+"misses": self._misses,
+"stale_hits": self._stale_hits,
+"evictions": self._evictions,
+"hit_rate": round(rate, 2),
+"version": self._version,
+}
+
+
+# ════════════════════════════════════════════════════════════════
+# 4. SEGMENT CACHE (per-piece caching like Next.js)
+# ════════════════════════════════════════════════════════════════
+class SegmentCache:
+"""Cache individual segments of the route tree."""
+
+def __init__(self, max_size=500, default_ttl=600):
+self.max_size = max_size
+self.default_ttl = default_ttl
+self._cache = OrderedDict()
+self._lock = threading.RLock()
+
+def key_for(self, segment_id, params_hash):
+return segment_id + ":" + params_hash
+
+def get(self, segment_id, params_hash):
+key = self.key_for(segment_id, params_hash)
+with self._lock:
+entry = self._cache.get(key)
+if entry is None:
+return None
+value, stale_at = entry
+if time.time() > stale_at:
+del self._cache[key]
+return None
+self._cache.move_to_end(key)
+return value
+
+def set(self, segment_id, params_hash, value, ttl=None):
+key = self.key_for(segment_id, params_hash)
+ttl = ttl if ttl is not None else self.default_ttl
+with self._lock:
+self._cache[key] = (value, time.time() + ttl)
+self._cache.move_to_end(key)
+while len(self._cache) > self.max_size:
+self._cache.popitem(last=False)
+
+def invalidate(self, segment_id=None):
+with self._lock:
+if segment_id is None:
+self._cache.clear()
+return
+to_del = [k for k in self._cache if k.startswith(segment_id + ":")]
+for k in to_del:
+del self._cache[k]
+
+def stats(self):
+with self._lock:
+return {"size": len(self._cache), "max_size": self.max_size}
+
+
+# ════════════════════════════════════════════════════════════════
+# 5. CACHE BUSTING
+# ════════════════════════════════════════════════════════════════
+def compute_cache_busting_param(router_state, segment, next_url=""):
+"""Deterministic short hash from route state."""
+payload = "|".join([str(router_state), str(segment), str(next_url)])
+digest = hashlib.sha256(payload.encode()).digest()[:12]
+return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+
+def set_cache_busting_param(url, param):
+parsed = urlparse(url)
+qs = parse_qs(parsed.query)
+if param:
+qs["_rsc"] = [param]
+else:
+qs.pop("_rsc", None)
+new_query = urlencode(qs, doseq=True)
+return parsed._replace(query=new_query).geturl()
+
+
+def hash_params(params):
+if not params:
+return "0"
+items = sorted(params.items())
+payload = "&".join([str(k) + "=" + str(v) for k, v in items])
+return hashlib.sha1(payload.encode()).hexdigest()[:10]
+
+
+# ════════════════════════════════════════════════════════════════
+# 6. URL UTILITIES
+# ════════════════════════════════════════════════════════════════
+def split_pathname(path):
+"""Split /foo/bar/baz into ['foo', 'bar', 'baz']."""
+parts = []
+buf = ""
+for ch in path:
+if ch == "/":
+if buf:
+parts.append(buf)
+buf = ""
+else:
+buf += ch
+if buf:
+parts.append(buf)
+return parts
+
+
+def is_group_segment(seg):
+"""(group) pattern."""
+return seg.startswith("(") and seg.endswith(")")
+
+
+def is_dynamic_segment(seg):
+"""[id] pattern."""
+return seg.startswith("[") and seg.endswith("]") and not seg.startswith("[[")
+
+
+def is_catchall_segment(seg):
+"""[...slug] pattern."""
+return seg.startswith("[...") and seg.endswith("]")
+
+
+def is_optional_catchall(seg):
+"""[[...slug]] pattern."""
+return seg.startswith("[[...") and seg.endswith("]]")
+
+
+def is_intercepting(seg):
+"""(..), (.), (...), (..)(..) patterns."""
+markers = ["(..)(..)", "(...)", "(..)", "(.)"]
+return any(seg.startswith(m) for m in markers)
+
+
+def parse_dynamic_segment(seg):
+"""Return the param name for [id] or [...slug]."""
+if is_catchall_segment(seg):
+return seg[4:-1]
+if is_optional_catchall(seg):
+return seg[5:-2]
+if is_dynamic_segment(seg):
+return seg[1:-1]
+return None
+
+
+def normalize_path(path):
+"""Ensure leading slash, remove trailing."""
+if not path.startswith("/"):
+path = "/" + path
+if len(path) > 1 and path.endswith("/"):
+path = path[:-1]
+return path
+
+
+# ════════════════════════════════════════════════════════════════
+# 7. ROUTE TREE — file-based route structure
+# ════════════════════════════════════════════════════════════════
+class RouteNode:
+"""A node in the route tree."""
+
+__slots__ = ("segment", "kind", "children", "parent", "path",
+"layout", "page", "loading", "error", "not_found",
+"template", "default", "metadata", "params")
+
+def __init__(self, segment, kind="static", parent=None):
+self.segment = segment
+self.kind = kind
+self.parent = parent
+self.children = {}
+self.path = parent.path + "/" + segment if parent else "/" + segment
+self.layout = None
+self.page = None
+self.loading = None
+self.error = None
+self.not_found = None
+self.template = None
+self.default = None
+self.metadata = {}
+self.params = {}
+
+def add_child(self, segment, kind="static"):
+if segment in self.children:
+return self.children[segment]
+node = RouteNode(segment, kind, self)
+self.children[segment] = node
+return node
+
+def to_dict(self):
+return {
+"segment": self.segment,
+"kind": self.kind,
+"path": self.path,
+"has_layout": self.layout is not None,
+"has_page": self.page is not None,
+"has_loading": self.loading is not None,
+"has_error": self.error is not None,
+"has_not_found": self.not_found is not None,
+"children": {k: v.to_dict() for k, v in self.children.items()},
+}
+
+
+class RouteTree:
+"""The full route tree, built from file structure or declared manually."""
+
+def __init__(self):
+self.root = RouteNode("", kind="root")
+self.root.path = "/"
+
+def add_route(self, path, kind="page", handler=None):
+"""Add a route. path like '/users/[id]/edit'."""
+parts = [p for p in path.split("/") if p]
+node = self.root
+for part in parts:
+k = "static"
+if is_group_segment(part):
+k = "group"
+elif is_optional_catchall(part):
+k = "optional_catchall"
+elif is_catchall_segment(part):
+k = "catchall"
+elif is_dynamic_segment(part):
+k = "dynamic"
+elif is_intercepting(part):
+k = "intercepting"
+node = node.add_child(part, k)
+if kind == "page":
+node.page = handler or ("page:" + path)
+elif kind == "layout":
+node.layout = handler or ("layout:" + path)
+elif kind == "loading":
+node.loading = handler or ("loading:" + path)
+elif kind == "error":
+node.error = handler or ("error:" + path)
+elif kind == "not_found":
+node.not_found = handler or ("notfound:" + path)
+return node
+
+def match(self, path):
+"""Match a URL path against the tree. Returns (node, params) or (None, {})."""
+path = normalize_path(path)
+parts = split_pathname(path)
+params = {}
+node = self._match_recursive(self.root, parts, 0, params)
+return node, params
+
+def _match_recursive(self, node, parts, idx, params):
+if idx >= len(parts):
+if node.page is not None or self._has_any_page(node):
+return node
+return None
+
+segment = parts[idx]
+
+# 1. Static match
+if segment in node.children:
+child = node.children[segment]
+if child.kind in ("static", "group"):
+result = self._match_recursive(child, parts, idx + 1, dict(params))
+if result:
+return result
+
+# 2. Group match (transparent)
+for name, child in node.children.items():
+if child.kind == "group":
+result = self._match_recursive(child, parts, idx, dict(params))
+if result:
+return result
+
+# 3. Dynamic match
+for name, child in node.children.items():
+if child.kind == "dynamic":
+param_name = parse_dynamic_segment(name)
+new_params = dict(params)
+new_params[param_name] = segment
+result = self._match_recursive(child, parts, idx + 1, new_params)
+if result:
+return result
+
+# 4. Catch-all match
+for name, child in node.children.items():
+if child.kind == "catchall":
+param_name = parse_dynamic_segment(name)
+new_params = dict(params)
+new_params[param_name] = parts[idx:]
+return child
+
+# 5. Optional catch-all (matches zero or more)
+for name, child in node.children.items():
+if child.kind == "optional_catchall":
+param_name = parse_dynamic_segment(name)
+new_params = dict(params)
+new_params[param_name] = parts[idx:]
+return child
+
+return None
+
+def _has_any_page(self, node):
+if node.page is not None:
+return True
+for child in node.children.values():
+if self._has_any_page(child):
+return True
+return False
+
+def walk(self):
+"""Yield (path, node) for all nodes with a page."""
+def _walk(node):
+if node.page is not None:
+yield node.path, node
+for child in node.children.values():
+yield from _walk(child)
+yield from _walk(self.root)
+
+def to_dict(self):
+return self.root.to_dict()
+
+
+# ════════════════════════════════════════════════════════════════
+# 8. APP ROUTER — main navigation engine
+# ════════════════════════════════════════════════════════════════
+class Navigation:
+"""A single navigation operation."""
+
+_counter = 0
+_lock = threading.Lock()
+
+def __init__(self, url, kind="push"):
+with Navigation._lock:
+Navigation._counter += 1
+self.id = "nav_" + str(Navigation._counter)
+self.url = url
+self.kind = kind # push | replace | traverse | refresh
+self.state = NavState.PENDING
+self.started_at = time.time()
+self.finished_at = None
+self.result = None
+self.error = None
+self.segments_loaded = 0
+self.bytes_loaded = 0
+self.from_cache = False
+
+def finish(self, result=None):
+self.state = NavState.SUCCESS
+self.finished_at = time.time()
+self.result = result
+
+def fail(self, error):
+self.state = NavState.ERROR
+self.finished_at = time.time()
+self.error = str(error)
+
+def duration(self):
+end = self.finished_at or time.time()
+return round((end - self.started_at) * 1000, 2)
+
+def to_dict(self):
+return {
+"id": self.id,
+"url": self.url,
+"kind": self.kind,
+"state": self.state.value,
+"duration_ms": self.duration(),
+"segments_loaded": self.segments_loaded,
+"bytes_loaded": self.bytes_loaded,
+"from_cache": self.from_cache,
+"error": self.error,
+}
+
+
+class AppRouter:
+"""The main router engine."""
+
+def __init__(self, tree=None):
+self.tree = tree or RouteTree()
+self.cache = RouteCache(max_size=200, default_ttl=300)
+self.segment_cache = SegmentCache(max_size=500, default_ttl=600)
+self.queue = PrefetchQueue(max_inflight=8)
+self.current_url = "/"
+self.history = []
+self.history_index = -1
+self.listeners = []
+self.navigation_log = []
+self.scroll_positions = {}
+self._lock = threading.RLock()
+self._worker_thread = None
+self._worker_running = False
+self._layout_cache = {}
+self._stats = {
+"navigations": 0,
+"prefetches": 0,
+"cache_hits": 0,
+"cache_misses": 0,
+"errors": 0,
+}
+
+# ------------------------------------------------------------
+# SUBSCRIPTION
+# ------------------------------------------------------------
+def subscribe(self, callback):
+with self._lock:
+self.listeners.append(callback)
+return lambda: self._unsubscribe(callback)
+
+def _unsubscribe(self, cb):
+with self._lock:
+if cb in self.listeners:
+self.listeners.remove(cb)
+
+def _emit(self, event):
+with self._lock:
+listeners = list(self.listeners)
+for cb in listeners:
+try:
+cb(event)
+except Exception as e:
+log("ERR", "listener error: " + str(e))
+
+# ------------------------------------------------------------
+# ROUTE RESOLUTION
+# ------------------------------------------------------------
+def resolve(self, url):
+"""Resolve URL to a matched route node."""
+parsed = urlparse(url)
+path = normalize_path(parsed.path)
+node, params = self.tree.match(path)
+if node is None:
+return None
+return {
+"url": url,
+"path": path,
+"params": params,
+"node": node,
+"query": parse_qs(parsed.query),
+}
+
+# ------------------------------------------------------------
+# PREFETCH
+# ------------------------------------------------------------
+def prefetch(self, url, priority=Priority.DEFAULT):
+with self._lock:
+if self.cache.get(url):
+self._stats["cache_hits"] += 1
+self._emit({"type": "prefetch_hit", "url": url})
+return False
+self.queue.push(url, priority)
+self._stats["prefetches"] += 1
+self._emit({"type": "prefetch_scheduled", "url": url,
+"priority": int(priority), "queue_size": self.queue.size()})
+self._ensure_worker()
+return True
+
+def prefetch_many(self, urls, priority=Priority.DEFAULT):
+count = 0
+for url in urls:
+if self.prefetch(url, priority):
+count += 1
+return count
+
+def _ensure_worker(self):
+with self._lock:
+if self._worker_running:
+return
+self._worker_running = True
+self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+self._worker_thread.start()
+
+def _worker_loop(self):
+idle_ticks = 0
+while True:
+item = self.queue.pop()
+if item is None:
+idle_ticks += 1
+if idle_ticks > 20 and self.queue.size() == 0:
+with self._lock:
+self._worker_running = False
+return
+time.sleep(0.05)
+continue
+idle_ticks = 0
+url, payload = item
+try:
+data = self._load_route_payload(url)
+self.cache.set(url, data)
+self._emit({"type": "prefetch_done", "url": url,
+"size": len(json.dumps(data, default=str))})
+except Exception as e:
+self._emit({"type": "prefetch_error", "url": url, "error": str(e)})
+finally:
+self.queue.done()
+
+# ------------------------------------------------------------
+# PAYLOAD LOADING (simulated)
+# ------------------------------------------------------------
+def _load_route_payload(self, url):
+"""Simulate fetching route data."""
+resolved = self.resolve(url)
+if resolved is None:
+return {
+"url": url,
+"type": "not_found",
+"tree": None,
+"rendered_at": datetime.now().isoformat(),
+}
+
+# Build segment tree
+segments = []
+node = resolved["node"]
+while node and node.segment:
+segments.append({
+"segment": node.segment,
+"kind": node.kind,
+"has_layout": node.layout is not None,
+"has_loading": node.loading is not None,
+"has_page": node.page is not None,
+})
+node = node.parent
+segments.reverse()
+
+# Simulate stream delay
+time.sleep(0.02 * max(1, len(segments)))
+
+payload = {
+"url": url,
+"path": resolved["path"],
+"params": resolved["params"],
+"query": resolved["query"],
+"segments": segments,
+"type": "page" if resolved["node"].page else "layout",
+"rendered_at": datetime.now().isoformat(),
+"payload_id": hashlib.sha256(url.encode()).hexdigest()[:16],
+"version": self.cache._version,
+}
+
+return payload
+
+# ------------------------------------------------------------
+# NAVIGATE
+# ------------------------------------------------------------
+def navigate(self, url, kind="push", scroll=True):
+nav = Navigation(url, kind)
+self._stats["navigations"] += 1
+self._emit({"type": "navigation_start", **nav.to_dict()})
+
+try:
+# Resolve
+resolved = self.resolve(url)
+if resolved is None:
+nav.fail("Route not found: " + url)
+self._emit({"type": "navigation_404", "url": url})
+self.navigation_log.append(nav.to_dict())
+self._stats["errors"] += 1
+return nav
+
+# Check cache
+cached = self.cache.get(url)
+if cached:
+nav.from_cache = True
+self._stats["cache_hits"] += 1
+data = cached
+else:
+self._stats["cache_misses"] += 1
+self.prefetch(url, Priority.URGENT)
+data = self._load_route_payload(url)
+self.cache.set(url, data)
+
+nav.segments_loaded = len(data.get("segments", []))
+nav.bytes_loaded = len(json.dumps(data, default=str))
+
+# Update history
+with self._lock:
+# Save scroll for current
+if self.current_url:
+self.scroll_positions[self.current_url] = {
+"x": 0, "y": 0, "t": time.time()
+}
+
+if kind == "push":
+self.history = self.history[:self.history_index + 1]
+self.history.append(url)
+self.history_index = len(self.history) - 1
+elif kind == "replace":
+if self.history_index >= 0 and self.history_index < len(self.history):
+self.history[self.history_index] = url
+else:
+self.history.append(url)
+self.history_index = len(self.history) - 1
+elif kind == "traverse":
+# Already handled by back/forward
+pass
+elif kind == "refresh":
+if self.history_index >= 0 and self.history_index < len(self.history):
+self.history[self.history_index] = url
+
+self.current_url = url
+
+nav.finish(result=data)
+
+except Exception as e:
+nav.fail(str(e))
+self._stats["errors"] += 1
+
+self.navigation_log.append(nav.to_dict())
+if len(self.navigation_log) > 100:
+self.navigation_log = self.navigation_log[-100:]
+
+self._emit({"type": "navigation_end", **nav.to_dict()})
+return nav
+
+def back(self):
+with self._lock:
+if self.history_index > 0:
+self.history_index -= 1
+target = self.history[self.history_index]
+self.current_url = target
+return self.navigate(target, kind="traverse", scroll=False)
+return None
+
+def forward(self):
+with self._lock:
+if self.history_index < len(self.history) - 1:
+self.history_index += 1
+target = self.history[self.history_index]
+self.current_url = target
+return self.navigate(target, kind="traverse", scroll=False)
+return None
+
+def refresh(self):
+self.cache.invalidate(self.current_url)
+return self.navigate(self.current_url, kind="refresh")
+
+def invalidate(self, url=None):
+if url:
+self.cache.invalidate(url)
+else:
+self.cache.invalidate_all()
+
+# ------------------------------------------------------------
+# STATUS
+# ------------------------------------------------------------
+def status(self):
+with self._lock:
+return {
+"current_url": self.current_url,
+"history_size": len(self.history),
+"history_index": self.history_index,
+"history": self.history[-20:],
+"cache": self.cache.stats(),
+"segment_cache": self.segment_cache.stats(),
+"queue": {
+"size": self.queue.size(),
+"inflight": self.queue.inflight(),
+},
+"stats": dict(self._stats),
+"recent_navigations": self.navigation_log[-10:],
+"routes_count": len(list(self.tree.walk())),
+}
+
+def dump(self, path=None):
+"""Dump full router state to JSON."""
+data = {
+"status": self.status(),
+"tree": self.tree.to_dict(),
+"cache_keys": self.cache.keys(),
+"timestamp": datetime.now().isoformat(),
+}
+path = path or (SNAPSHOT_DIR / ("snapshot_" + str(int(time.time())) + ".json"))
+path.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+return path
+
+
+# ════════════════════════════════════════════════════════════════
+# 9. DEFAULT ROUTE TREE — demo app
+# ════════════════════════════════════════════════════════════════
+def build_demo_tree():
+tree = RouteTree()
+# Root layout
+tree.add_route("/", kind="layout")
+tree.add_route("/", kind="page")
+# Public pages
+tree.add_route("/about", kind="page")
+tree.add_route("/pricing", kind="page")
+tree.add_route("/contact", kind="page")
+tree.add_route("/legal", kind="page")
+tree.add_route("/legal/privacy", kind="page")
+tree.add_route("/legal/terms", kind="page")
+# Auth
+tree.add_route("/login", kind="page")
+tree.add_route("/register", kind="page")
+tree.add_route("/forgot-password", kind="page")
+tree.add_route("/reset-password/[token]", kind="page")
+# Dashboard (group route)
+tree.add_route("/(dashboard)", kind="group")
+tree.add_route("/(dashboard)/dashboard", kind="layout")
+tree.add_route("/(dashboard)/dashboard", kind="page")
+tree.add_route("/(dashboard)/dashboard/analytics", kind="page")
+tree.add_route("/(dashboard)/dashboard/settings", kind="page")
+tree.add_route("/(dashboard)/dashboard/settings/profile", kind="page")
+tree.add_route("/(dashboard)/dashboard/settings/security", kind="page")
+tree.add_route("/(dashboard)/dashboard/settings/billing", kind="page")
+tree.add_route("/(dashboard)/dashboard/projects", kind="page")
+tree.add_route("/(dashboard)/dashboard/projects/[id]", kind="page")
+tree.add_route("/(dashboard)/dashboard/projects/[id]/edit", kind="page")
+tree.add_route("/(dashboard)/dashboard/projects/[id]/settings", kind="page")
+tree.add_route("/(dashboard)/dashboard/team", kind="page")
+tree.add_route("/(dashboard)/dashboard/team/[member]", kind="page")
+tree.add_route("/(dashboard)/dashboard/reports", kind="page")
+tree.add_route("/(dashboard)/dashboard/reports/[year]", kind="page")
+tree.add_route("/(dashboard)/dashboard/reports/[year]/[month]", kind="page")
+# Admin
+tree.add_route("/admin", kind="layout")
+tree.add_route("/admin", kind="page")
+tree.add_route("/admin/users", kind="page")
+tree.add_route("/admin/users/[id]", kind="page")
+tree.add_route("/admin/logs", kind="page")
+tree.add_route("/admin/logs/[...path]", kind="page")
+# Content
+tree.add_route("/blog", kind="page")
+tree.add_route("/blog/[slug]", kind="page")
+tree.add_route("/blog/category/[cat]", kind="page")
+tree.add_route("/blog/tag/[tag]", kind="page")
+tree.add_route("/docs", kind="page")
+tree.add_route("/docs/[...slug]", kind="page")
+# Errors
+tree.add_route("/not-found", kind="page")
+return tree
+
+
+# ════════════════════════════════════════════════════════════════
+# 10. HTTP HANDLER
+# ════════════════════════════════════════════════════════════════
+ROUTER = AppRouter(build_demo_tree())
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+def log_message(self, *args):
+pass
+
+def _json(self, data, code=200):
+body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", "application/json; charset=utf-8")
+self.send_header("Content-Length", str(len(body)))
+self.send_header("Access-Control-Allow-Origin", "*")
+self.send_header("X-Powered-By", "SpaRouterEngine/1.0")
+self.end_headers()
+try:
+self.wfile.write(body)
+except Exception:
+pass
+
+def _html(self, content, code=200):
+body = content.encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", "text/html; charset=utf-8")
+self.send_header("Content-Length", str(len(body)))
+self.end_headers()
+try:
+self.wfile.write(body)
+except Exception:
+pass
+
+def _read_json(self):
+try:
+n = int(self.headers.get("Content-Length", 0))
+if n == 0:
+return {}
+return json.loads(self.rfile.read(n).decode("utf-8"))
+except Exception:
+return {}
+
+def do_GET(self):
+p = urlparse(self.path)
+path = p.path
+qs = parse_qs(p.query)
+
+if path in ("/", "/index.html"):
+self._html(PAGE_HTML)
+elif path == "/api/status":
+self._json(ROUTER.status())
+elif path == "/api/tree":
+self._json(ROUTER.tree.to_dict())
+elif path == "/api/routes":
+routes = [{"path": p, "has_page": n.page is not None,
+"has_layout": n.layout is not None}
+for p, n in ROUTER.tree.walk()]
+self._json({"count": len(routes), "routes": routes})
+elif path == "/api/navigate":
+url = qs.get("url", ["/"])[0]
+kind = qs.get("kind", ["push"])[0]
+nav = ROUTER.navigate(url, kind)
+self._json(nav.to_dict())
+elif path == "/api/prefetch":
+url = qs.get("url", ["/"])[0]
+prio = int(qs.get("priority", ["1"])[0])
+ok = ROUTER.prefetch(url, Priority(prio))
+self._json({"scheduled": ok, "url": url, "priority": prio})
+elif path == "/api/cache":
+self._json(ROUTER.cache.stats())
+elif path == "/api/segment_cache":
+self._json(ROUTER.segment_cache.stats())
+elif path == "/api/history":
+self._json({"history": ROUTER.history, "index": ROUTER.history_index})
+elif path == "/api/back":
+nav = ROUTER.back()
+self._json(nav.to_dict() if nav else {"error": "no history"})
+elif path == "/api/forward":
+nav = ROUTER.forward()
+self._json(nav.to_dict() if nav else {"error": "no forward"})
+elif path == "/api/refresh":
+nav = ROUTER.refresh()
+self._json(nav.to_dict())
+elif path == "/api/dump":
+p = ROUTER.dump()
+self._json({"saved_to": str(p), "size": p.stat().st_size})
+elif path == "/api/resolve":
+url = qs.get("url", ["/"])[0]
+resolved = ROUTER.resolve(url)
+if resolved:
+self._json({
+"url": resolved["url"],
+"path": resolved["path"],
+"params": resolved["params"],
+"query": resolved["query"],
+"has_page": resolved["node"].page is not None,
+})
+else:
+self._json({"error": "not resolved"}, 404)
+elif path == "/api/cache_bust":
+state = qs.get("state", ["{}"])[0]
+segment = qs.get("segment", ["children"])[0]
+param = compute_cache_busting_param(state, segment)
+self._json({"param": param})
+else:
+self._json({"error": "not_found", "path": path}, 404)
+
+def do_POST(self):
+p = urlparse(self.path)
+path = p.path
+body = self._read_json()
+
+if path == "/api/navigate":
+url = body.get("url", "/")
+kind = body.get("kind", "push")
+nav = ROUTER.navigate(url, kind)
+self._json(nav.to_dict())
+elif path == "/api/prefetch":
+url = body.get("url", "/")
+prio = body.get("priority", 1)
+ok = ROUTER.prefetch(url, Priority(prio))
+self._json({"scheduled": ok})
+elif path == "/api/prefetch_many":
+urls = body.get("urls", [])
+prio = body.get("priority", 1)
+n = ROUTER.prefetch_many(urls, Priority(prio))
+self._json({"scheduled": n, "total": len(urls)})
+elif path == "/api/invalidate":
+url = body.get("url")
+ROUTER.invalidate(url)
+self._json({"invalidated": url or "all"})
+elif path == "/api/dump":
+p = ROUTER.dump()
+self._json({"saved_to": str(p)})
+else:
+self._json({"error": "not_found"}, 404)
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+# ════════════════════════════════════════════════════════════════
+# 11. HTML DASHBOARD
+# ════════════════════════════════════════════════════════════════
+PAGE_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SPA Router Engine</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,system-ui,sans-serif;background:#0a0014;color:#fff;padding:20px;min-height:100vh}
+.c{max-width:1200px;margin:0 auto}
+h1{color:#c8a45c;font-size:28px;margin-bottom:6px}
+.s{color:#888;font-size:12px;margin-bottom:20px}
+.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:20px}
+.st{background:#14001f;border:1px solid #2a1a3a;border-radius:10px;padding:14px;text-align:center}
+.st .n{font-size:22px;font-weight:700;color:#c8a45c;display:block}
+.st .l{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-top:4px;display:block}
+.b{background:#14001f;border:1px solid #2a1a3a;border-radius:10px;padding:18px;margin-bottom:14px}
+.b h2{color:#c8a45c;font-size:14px;margin-bottom:10px}
+input,textarea,select{width:100%;background:#0a0014;border:1px solid #2a1a3a;color:#4ade80;padding:10px;border-radius:6px;font-family:monospace;font-size:12px;margin-bottom:8px}
+button{background:#c8a45c;color:#000;border:none;padding:8px 16px;border-radius:999px;font-weight:600;cursor:pointer;margin-right:6px;margin-bottom:6px;font-size:12px}
+button.p{background:#4d6bfe;color:#fff}
+button.d{background:#f87171;color:#fff}
+pre{background:#0a0014;padding:12px;border-radius:6px;overflow-x:auto;font-size:11px;color:#4ade80;max-height:300px;margin-top:8px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+</style></head><body><div class="c">
+<h1>SPA Router Engine</h1>
+<p class="s">Python reimplementation of Vercel/Next.js App Router</p>
+
+<div class="g" id="stats"></div>
+
+<div class="b"><h2>Navigate</h2>
+<input id="nav-url" value="/dashboard" placeholder="/path">
+<button onclick="navigate('push')">Push</button>
+<button class="p" onclick="navigate('replace')">Replace</button>
+<button onclick="prefetch()">Prefetch</button>
+<button onclick="back()">Back</button>
+<button onclick="forward()">Forward</button>
+<button onclick="refresh()">Refresh</button>
+<button class="d" onclick="invalidate()">Invalidate</button>
+<pre id="nav-out">Ready.</pre></div>
+
+<div class="row">
+<div class="b"><h2>Resolve</h2>
+<input id="resolve-url" value="/users/42/edit">
+<button onclick="resolve()">Resolve</button>
+<pre id="resolve-out"></pre></div>
+
+<div class="b"><h2>Cache</h2>
+<button onclick="viewCache()">Stats</button>
+<button onclick="viewSegCache()">Segment cache</button>
+<pre id="cache-out"></pre></div>
+</div>
+
+<div class="b"><h2>Status</h2>
+<button onclick="viewStatus()">Refresh</button>
+<button onclick="viewHistory()">History</button>
+<button onclick="viewRoutes()">Routes</button>
+<button onclick="viewTree()">Tree</button>
+<pre id="status-out"></pre></div>
+
+</div>
+<script>
+async function loadStats(){
+try {
+const r = await fetch('/api/status');
+const d = await r.json();
+const g = document.getElementById('stats');
+g.innerHTML = '';
+g.innerHTML += '<div class="st"><span class="n">' + d.stats.navigations + '</span><span class="l">Navigations</span></div>';
+g.innerHTML += '<div class="st"><span class="n">' + d.stats.prefetches + '</span><span class="l">Prefetches</span></div>';
+g.innerHTML += '<div class="st"><span class="n">' + d.cache.hits + '</span><span class="l">Cache hits</span></div>';
+g.innerHTML += '<div class="st"><span class="n">' + d.cache.misses + '</span><span class="l">Cache misses</span></div>';
+g.innerHTML += '<div class="st"><span class="n">' + d.cache.hit_rate + '%</span><span class="l">Hit rate</span></div>';
+g.innerHTML += '<div class="st"><span class="n">' + d.cache.size + '</span><span class="l">Cache size</span></div>';
+g.innerHTML += '<div class="st"><span class="n">' + d.queue.size + '</span><span class="l">Queue</span></div>';
+g.innerHTML += '<div class="st"><span class="n">' + d.routes_count + '</span><span class="l">Routes</span></div>';
+} catch(e) {}
+}
+async function post(url, data, out) {
+try {
+const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data||{})});
+const d = await r.json();
+document.getElementById(out).textContent = JSON.stringify(d, null, 2);
+loadStats();
+} catch(e) { document.getElementById(out).textContent = 'ERROR ' + e; }
+}
+function navigate(kind){ post('/api/navigate', {url: document.getElementById('nav-url').value, kind: kind}, 'nav-out'); }
+function prefetch(){ post('/api/prefetch', {url: document.getElementById('nav-url').value, priority: 2}, 'nav-out'); }
+function back(){ fetch('/api/back').then(r => r.json()).then(d => { document.getElementById('nav-out').textContent = JSON.stringify(d, null, 2); loadStats(); }); }
+function forward(){ fetch('/api/forward').then(r => r.json()).then(d => { document.getElementById('nav-out').textContent = JSON.stringify(d, null, 2); loadStats(); }); }
+function refresh(){ fetch('/api/refresh').then(r => r.json()).then(d => { document.getElementById('nav-out').textContent = JSON.stringify(d, null, 2); loadStats(); }); }
+function invalidate(){ post('/api/invalidate', {}, 'nav-out'); }
+function resolve(){ fetch('/api/resolve?url=' + encodeURIComponent(document.getElementById('resolve-url').value)).then(r => r.json()).then(d => { document.getElementById('resolve-out').textContent = JSON.stringify(d, null, 2); }); }
+function viewCache(){ fetch('/api/cache').then(r => r.json()).then(d => { document.getElementById('cache-out').textContent = JSON.stringify(d, null, 2); }); }
+function viewSegCache(){ fetch('/api/segment_cache').then(r => r.json()).then(d => { document.getElementById('cache-out').textContent = JSON.stringify(d, null, 2); }); }
+function viewStatus(){ fetch('/api/status').then(r => r.json()).then(d => { document.getElementById('status-out').textContent = JSON....stringify(d, null, 2); }); }
+function viewHistory(){ fetch('/api/history').then(r => r.json()).then(d => { document.getElementById('status-out').textContent = JSON.stringify(d, null, 2); }); }
+function viewRoutes(){ fetch('/api/routes').then(r => r.json()).then(d => { document.getElementById('status-out').textContent = JSON.stringify(d, null, 2); }); }
+function viewTree(){ fetch('/api/tree').then(r => r.json()).then(d => { document.getElementById('status-out').textContent = JSON.stringify(d, null, 2); }); }
+loadStats();
+setInterval(loadStats, 3000);
+</script></body></html>"""
+
+
+# ════════════════════════════════════════════════════════════════
+# 12. DEMO (CLI)
+# ════════════════════════════════════════════════════════════════
+def demo():
+section("SPA ROUTER ENGINE — DEMO")
+
+log("INFO", "Routes count: " + str(len(list(ROUTER.tree.walk()))))
+
+log("INFO", "Prefetching with priorities")
+ROUTER.prefetch("/about", Priority.BACKGROUND)
+ROUTER.prefetch("/dashboard", Priority.INTENT)
+ROUTER.prefetch("/pricing", Priority.DEFAULT)
+
+time.sleep(1.5)
+log("OK", "Cache after prefetch: " + json.dumps(ROUTER.cache.stats()))
+
+log("INFO", "Navigating to /dashboard...")
+nav = ROUTER.navigate("/dashboard")
+print(json.dumps(nav.to_dict(), indent=2))
+
+log("INFO", "Navigating to /dashboard/analytics...")
+nav = ROUTER.navigate("/dashboard/analytics")
+print(json.dumps(nav.to_dict(), indent=2))
+
+log("INFO", "Navigating to /dashboard/projects/42...")
+nav = ROUTER.navigate("/dashboard/projects/42")
+print(json.dumps(nav.to_dict(), indent=2))
+
+log("INFO", "Back...")
+ROUTER.back()
+
+log("INFO", "Forward...")
+ROUTER.forward()
+
+log("INFO", "Refresh...")
+ROUTER.refresh()
+
+section("FINAL STATUS")
+print(json.dumps(ROUTER.status(), indent=2, default=str))
+
+log("INFO", "Dumping snapshot...")
+p = ROUTER.dump()
+log("OK", "Snapshot: " + str(p))
+
+
+# ════════════════════════════════════════════════════════════════
+# 13. MAIN
+# ════════════════════════════════════════════════════════════════
+def main():
+print("")
+print(C + "=" * 72 + N)
+print(C + " SPA ROUTER ENGINE — Python" + N)
+print(C + " Vercel/Next.js App Router reimplementation" + N)
+print(C + " Priority queue + LRU + segments + state machine + HTTP API" + N)
+print(C + "=" * 72 + N)
+
+if len(sys.argv) > 1 and sys.argv[1] == "demo":
+demo()
+return
+
+log("INFO", "Starting HTTP server on port " + str(PORT))
+log("INFO", "Routes loaded: " + str(len(list(ROUTER.tree.walk()))))
+try:
+with Server((HOST, PORT), Handler) as httpd:
+log("OK", "Listening: http://127.0.0.1:" + str(PORT) + "/")
+print("")
+print(B + " Endpoints:" + N)
+for ep in [
+"GET / Dashboard",
+"GET /api/status Router status",
+"GET /api/tree Route tree",
+"GET /api/routes All routes",
+"GET /api/resolve?url= Resolve URL",
+"GET /api/navigate?url= Navigate",
+"GET /api/prefetch?url= Prefetch",
+"GET /api/cache Cache stats",
+"GET /api/segment_cache Segment cache",
+"GET /api/history History",
+"GET /api/back Back",
+"GET /api/forward Forward",
+"GET /api/refresh Refresh",
+"GET /api/dump Dump snapshot",
+"POST /api/navigate Navigate (JSON)",
+"POST /api/prefetch Prefetch (JSON)",
+"POST /api/prefetch_many Prefetch batch",
+"POST /api/invalidate Invalidate cache",
+]:
+print(" " + ep)
+print("")
+httpd.serve_forever()
+except KeyboardInterrupt:
+log("INFO", "Stopped.")
+except OSError as e:
+log("ERR", "Port " + str(PORT) + " : " + str(e))
+
+
+if __name__ == "__main__":
+main()

@@ -1,0 +1,3443 @@
+#!/usr/bin/env python3
+
+# -*- coding: utf-8 -*-
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# NEXUS ROUTER v5.1.0 — Full-stack Python web framework · single file
+
+# Auteur : Aissa Mohammedi (DGK) · Localhost : 127.0.0.1:9986
+
+# Licence : NEXUS-OPEN-3.0
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+import os
+
+import sys
+
+import re
+
+import io
+
+import json
+
+import html
+
+import time
+
+import uuid
+
+import hmac
+
+import base64
+
+import struct
+
+import hashlib
+
+import secrets
+
+import sqlite3
+
+import argparse
+
+import threading
+
+import urllib.parse
+
+import http.server
+
+import socketserver
+
+import traceback
+
+import gzip
+
+import zlib
+
+import queue
+
+from pathlib import Path
+
+from datetime import datetime, timezone
+
+from collections import OrderedDict, defaultdict, deque
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# CONFIG — LOCALHOST
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+VERSION = "5.1.0"
+
+AUTEUR = "Aissa Mohammedi (DGK)"
+
+LICENCE = "NEXUS-OPEN-3.0"
+
+
+
+HOST = "127.0.0.1"
+
+PORT = 9986
+
+
+
+DEBUG = True
+
+ENABLE_GZIP = True
+
+ENABLE_ETAG = True
+
+ENABLE_HMR = True
+
+ENABLE_WS = True
+
+ENABLE_GRAPHQL = True
+
+ENABLE_PROMETHEUS = True
+
+ENABLE_CSRF = False
+
+
+
+RATE_LIMIT_PER_MIN = 1200
+
+SESSION_TTL = 86400
+
+CACHE_L1_MAX = 1000
+
+CACHE_L2_MAX_MB = 100
+
+CACHE_L2_TTL = 3600
+
+
+
+JWT_SECRET = os.environ.get("NEXUS_JWT_SECRET") or secrets.token_hex(32)
+
+
+
+try:
+
+    HOME = Path.home()
+
+except Exception:
+
+    HOME = Path(os.path.expanduser("~"))
+
+
+
+_CANDIDATES = [
+
+    Path.cwd() / "nexus_router_data",
+
+    HOME / "Documents" / "nexus_router",
+
+    HOME / "nexus_router",
+
+    Path("/tmp/nexus_router"),
+
+]
+
+
+
+BASE = None
+
+for _c in _CANDIDATES:
+
+    try:
+
+        _c.mkdir(parents=True, exist_ok=True)
+
+        _t = _c / ".wt"
+
+        _t.write_text("ok")
+
+        _t.unlink()
+
+        BASE = _c
+
+        break
+
+    except Exception:
+
+        continue
+
+
+
+if BASE is None:
+
+    BASE = Path.cwd() / "nexus_router_data"
+
+    BASE.mkdir(parents=True, exist_ok=True)
+
+
+
+CACHE_DIR = BASE / "cache"
+
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+SESSIONS_DIR = BASE / "sessions"
+
+SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_FILE = BASE / "nexus.db"
+
+LOG_FILE = BASE / "router.log"
+
+
+
+
+
+def log(msg, level="INFO"):
+
+    try:
+
+        line = "[{}] [{}] {}".format(datetime.now().strftime("%H:%M:%S"), level, msg)
+
+        print(line, flush=True)
+
+    except Exception:
+
+        pass
+
+    try:
+
+        with open(str(LOG_FILE), "a", encoding="utf-8") as f:
+
+            f.write(str(msg) + "\n")
+
+    except Exception:
+
+        pass
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# HTTP ERRORS
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+class HTTPError(Exception):
+
+    def __init__(self, status=500, message=""):
+
+        self.status = status
+
+        self.message = message
+
+        super().__init__(message)
+
+
+
+
+
+class NotFound(HTTPError):
+
+    def __init__(self, message="Page introuvable"):
+
+        super().__init__(404, message)
+
+
+
+
+
+class BadRequest(HTTPError):
+
+    def __init__(self, message="Requête invalide"):
+
+        super().__init__(400, message)
+
+
+
+
+
+class Unauthorized(HTTPError):
+
+    def __init__(self, message="Non authentifié"):
+
+        super().__init__(401, message)
+
+
+
+
+
+class Forbidden(HTTPError):
+
+    def __init__(self, message="Accès refusé"):
+
+        super().__init__(403, message)
+
+
+
+
+
+class ValidationError(HTTPError):
+
+    def __init__(self, errors):
+
+        self.errors = errors
+
+        super().__init__(400, "Validation échouée")
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# JWT
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+def b64url_encode(data):
+
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+
+
+
+def b64url_decode(s):
+
+    s = s + "=" * (-len(s) % 4)
+
+    return base64.urlsafe_b64decode(s.encode("ascii"))
+
+
+
+
+
+def jwt_encode(payload, exp_hours=24):
+
+    header = {"alg": "HS256", "typ": "JWT"}
+
+    now = int(time.time())
+
+    payload = dict(payload)
+
+    payload["iat"] = now
+
+    payload["exp"] = now + exp_hours * 3600
+
+    h = b64url_encode(json.dumps(header, separators=(",", ":")).encode())
+
+    p = b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
+
+    signing_input = (h + "." + p).encode("ascii")
+
+    sig = hmac.new(JWT_SECRET.encode(), signing_input, hashlib.sha256).digest()
+
+    return h + "." + p + "." + b64url_encode(sig)
+
+
+
+
+
+def jwt_decode(token):
+
+    try:
+
+        parts = token.split(".")
+
+        if len(parts) != 3:
+
+            return None
+
+        h, p, sig = parts
+
+        signing_input = (h + "." + p).encode("ascii")
+
+        expected = hmac.new(JWT_SECRET.encode(), signing_input, hashlib.sha256).digest()
+
+        got = b64url_decode(sig)
+
+        if not hmac.compare_digest(expected, got):
+
+            return None
+
+        payload = json.loads(b64url_decode(p))
+
+        if payload.get("exp", 0) < time.time():
+
+            return None
+
+        return payload
+
+    except Exception:
+
+        return None
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# CACHE L1 + L2
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+class CacheL1:
+
+    def __init__(self, max_size=CACHE_L1_MAX):
+
+        self.max_size = max_size
+
+        self.data = OrderedDict()
+
+        self.lock = threading.RLock()
+
+        self.hits = 0
+
+        self.misses = 0
+
+        self.evictions = 0
+
+
+
+    def get(self, key):
+
+        with self.lock:
+
+            if key in self.data:
+
+                self.data.move_to_end(key)
+
+                self.hits += 1
+
+                return self.data[key]
+
+            self.misses += 1
+
+            return None
+
+
+
+    def set(self, key, value):
+
+        with self.lock:
+
+            if key in self.data:
+
+                self.data.move_to_end(key)
+
+            self.data[key] = value
+
+            while len(self.data) > self.max_size:
+
+                self.data.popitem(last=False)
+
+                self.evictions += 1
+
+
+
+    def clear(self):
+
+        with self.lock:
+
+            self.data.clear()
+
+
+
+    def stats(self):
+
+        with self.lock:
+
+            total = self.hits + self.misses
+
+            return {
+
+                "size": len(self.data),
+
+                "max": self.max_size,
+
+                "hits": self.hits,
+
+                "misses": self.misses,
+
+                "evictions": self.evictions,
+
+                "hit_rate": round(self.hits / total * 100, 1) if total else 0.0,
+
+            }
+
+
+
+
+
+class CacheL2:
+
+    def __init__(self, path, max_mb=CACHE_L2_MAX_MB, ttl=CACHE_L2_TTL):
+
+        self.path = path
+
+        self.max_mb = max_mb
+
+        self.ttl = ttl
+
+        self.lock = threading.RLock()
+
+        path.mkdir(parents=True, exist_ok=True)
+
+        self.hits = 0
+
+        self.misses = 0
+
+
+
+    def _key_path(self, key):
+
+        h = hashlib.sha256(key.encode()).hexdigest()
+
+        return self.path / (h[:2] + "_" + h[2:] + ".cache")
+
+
+
+    def get(self, key):
+
+        fp = self._key_path(key)
+
+        if not fp.exists():
+
+            with self.lock:
+
+                self.misses += 1
+
+            return None
+
+        try:
+
+            with open(str(fp), "rb") as f:
+
+                raw = zlib.decompress(f.read())
+
+            meta_end = raw.index(b"\n")
+
+            meta = json.loads(raw[:meta_end].decode())
+
+            if time.time() - meta["ts"] > self.ttl:
+
+                fp.unlink(missing_ok=True)
+
+                with self.lock:
+
+                    self.misses += 1
+
+                return None
+
+            body = raw[meta_end + 1:].decode("utf-8")
+
+            with self.lock:
+
+                self.hits += 1
+
+            return body
+
+        except Exception:
+
+            with self.lock:
+
+                self.misses += 1
+
+            return None
+
+
+
+    def set(self, key, value):
+
+        try:
+
+            meta = json.dumps({"ts": time.time(), "key": key[:200]}).encode()
+
+            payload = meta + b"\n" + value.encode("utf-8")
+
+            with open(str(self._key_path(key)), "wb") as f:
+
+                f.write(zlib.compress(payload, level=6))
+
+        except Exception:
+
+            pass
+
+
+
+    def clear(self):
+
+        with self.lock:
+
+            for f in self.path.glob("*.cache"):
+
+                try:
+
+                    f.unlink()
+
+                except Exception:
+
+                    pass
+
+
+
+    def stats(self):
+
+        files = list(self.path.glob("*.cache"))
+
+        size = sum(f.stat().st_size for f in files)
+
+        total = self.hits + self.misses
+
+        return {
+
+            "files": len(files),
+
+            "size_mb": round(size / 1024 / 1024, 2),
+
+            "max_mb": self.max_mb,
+
+            "hits": self.hits,
+
+            "misses": self.misses,
+
+            "hit_rate": round(self.hits / total * 100, 1) if total else 0.0,
+
+            "ttl": self.ttl,
+
+        }
+
+
+
+
+
+CACHE_1 = CacheL1()
+
+CACHE_2 = CacheL2(CACHE_DIR)
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ROUTER RADIX TREE
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+class RouteNode:
+
+    __slots__ = ("static", "param", "wildcard", "handlers")
+
+    def __init__(self):
+
+        self.static = {}
+
+        self.param = None
+
+        self.wildcard = None
+
+        self.handlers = {}
+
+
+
+
+
+class RadixRouter:
+
+    def __init__(self):
+
+        self.root = RouteNode()
+
+        self.routes = []
+
+        self.lock = threading.RLock()
+
+
+
+    def add(self, path, handler, methods=None, description="", group=""):
+
+        methods = methods or ["GET"]
+
+        segments = [s for s in path.strip("/").split("/") if s]
+
+        with self.lock:
+
+            node = self.root
+
+            param_names = []
+
+            for seg in segments:
+
+                if seg.startswith(":"):
+
+                    name = seg[1:]
+
+                    param_names.append(name)
+
+                    if node.param is None:
+
+                        node.param = (name, RouteNode())
+
+                    node = node.param[1]
+
+                elif seg.startswith("*"):
+
+                    name = seg[1:] or "wildcard"
+
+                    param_names.append(name)
+
+                    if node.wildcard is None:
+
+                        node.wildcard = (name, RouteNode())
+
+                    node = node.wildcard[1]
+
+                else:
+
+                    if seg not in node.static:
+
+                        node.static[seg] = RouteNode()
+
+                    node = node.static[seg]
+
+            for m in methods:
+
+                node.handlers[m] = {
+
+                    "handler": handler,
+
+                    "path": path,
+
+                    "param_names": param_names,
+
+                    "methods": methods,
+
+                    "description": description,
+
+                    "group": group,
+
+                }
+
+            self.routes.append({
+
+                "path": path,
+
+                "methods": methods,
+
+                "handler": handler.__name__ if hasattr(handler, "__name__") else "lambda",
+
+                "description": description,
+
+                "group": group,
+
+            })
+
+
+
+    def match(self, path, method="GET"):
+
+        segments = [s for s in path.strip("/").split("/") if s]
+
+        params = {}
+
+
+
+        def _walk(node, i):
+
+            if i == len(segments):
+
+                return node.handlers.get(method) or node.handlers.get("*")
+
+            seg = segments[i]
+
+            if seg in node.static:
+
+                r = _walk(node.static[seg], i + 1)
+
+                if r:
+
+                    return r
+
+            if node.param is not None:
+
+                name, child = node.param
+
+                params[name] = urllib.parse.unquote(seg)
+
+                r = _walk(child, i + 1)
+
+                if r:
+
+                    return r
+
+                params.pop(name, None)
+
+            if node.wildcard is not None:
+
+                name, child = node.wildcard
+
+                params[name] = "/".join(segments[i:])
+
+                return child.handlers.get(method) or child.handlers.get("*")
+
+            return None
+
+
+
+        m = _walk(self.root, 0)
+
+        if m:
+
+            m = dict(m)
+
+            m["params"] = params
+
+        return m
+
+
+
+
+
+ROUTER = RadixRouter()
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# SESSION
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+class Session:
+
+    def __init__(self, token, data=None, ttl=SESSION_TTL):
+
+        self.token = token
+
+        self.data = data or {}
+
+        self.created = time.time()
+
+        self.expires = time.time() + ttl
+
+        self.dirty = False
+
+
+
+    def is_valid(self):
+
+        return time.time() < self.expires
+
+
+
+    def get(self, k, default=None):
+
+        return self.data.get(k, default)
+
+
+
+    def set(self, k, v):
+
+        self.data[k] = v
+
+        self.dirty = True
+
+
+
+
+
+class SessionStore:
+
+    def __init__(self, path, ttl=SESSION_TTL):
+
+        self.path = path
+
+        self.ttl = ttl
+
+        self.cache = {}
+
+        self.lock = threading.RLock()
+
+
+
+    def create(self, data=None):
+
+        token = secrets.token_urlsafe(32)
+
+        s = Session(token, data, self.ttl)
+
+        with self.lock:
+
+            self.cache[token] = s
+
+        return token
+
+
+
+    def get(self, token):
+
+        if not token:
+
+            return None
+
+        with self.lock:
+
+            s = self.cache.get(token)
+
+        if s and s.is_valid():
+
+            return s
+
+        return None
+
+
+
+    def destroy(self, token):
+
+        with self.lock:
+
+            self.cache.pop(token, None)
+
+
+
+    def count(self):
+
+        with self.lock:
+
+            return len(self.cache)
+
+
+
+
+
+SESSIONS = SessionStore(SESSIONS_DIR)
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# DB
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+class DB:
+
+    _lock = threading.RLock()
+
+    _local = threading.local()
+
+
+
+    @classmethod
+
+    def conn(cls):
+
+        if not hasattr(cls._local, "conn"):
+
+            c = sqlite3.connect(str(DB_FILE), timeout=30, check_same_thread=False)
+
+            c.execute("PRAGMA journal_mode=WAL")
+
+            c.row_factory = sqlite3.Row
+
+            cls._local.conn = c
+
+        return cls._local.conn
+
+
+
+    @classmethod
+
+    def init(cls):
+
+        with cls._lock:
+
+            c = cls.conn()
+
+            c.executescript("""
+
+                CREATE TABLE IF NOT EXISTS users (
+
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                    username TEXT UNIQUE NOT NULL,
+
+                    email TEXT,
+
+                    password_hash TEXT NOT NULL,
+
+                    created_at REAL NOT NULL,
+
+                    last_login REAL
+
+                );
+
+                CREATE TABLE IF NOT EXISTS visits (
+
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                    path TEXT, ip TEXT, ua TEXT, ts REAL
+
+                );
+
+            """)
+
+            c.commit()
+
+
+
+    @classmethod
+
+    def execute(cls, sql, params=()):
+
+        with cls._lock:
+
+            return cls.conn().execute(sql, params)
+
+
+
+    @classmethod
+
+    def fetchone(cls, sql, params=()):
+
+        return cls.execute(sql, params).fetchone()
+
+
+
+    @classmethod
+
+    def fetchall(cls, sql, params=()):
+
+        return cls.execute(sql, params).fetchall()
+
+
+
+    @classmethod
+
+    def insert(cls, sql, params=()):
+
+        return cls.execute(sql, params).lastrowid
+
+
+
+
+
+DB.init()
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# AUTH
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+def hash_password(password, salt=None):
+
+    if salt is None:
+
+        salt = secrets.token_hex(16)
+
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000)
+
+    return "pbkdf2$" + salt + "$" + dk.hex()
+
+
+
+
+
+def verify_password(password, stored):
+
+    try:
+
+        parts = stored.split("$")
+
+        if len(parts) != 3:
+
+            return False
+
+        salt = parts[1]
+
+        expected = parts[2]
+
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000)
+
+        return secrets.compare_digest(dk.hex(), expected)
+
+    except Exception:
+
+        return False
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# VALIDATION
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+def validate_schema(data, schema):
+
+    errors = {}
+
+    out = {}
+
+    for key, rule in schema.items():
+
+        required = rule.get("required", False)
+
+        if key not in data or data[key] == "":
+
+            if required:
+
+                errors[key] = "Champ requis"
+
+            continue
+
+        val = data[key]
+
+        t = rule.get("type", "str")
+
+        try:
+
+            if t == "int":
+
+                val = int(val)
+
+            elif t == "float":
+
+                val = float(val)
+
+            elif t == "str":
+
+                val = str(val).strip()
+
+        except Exception:
+
+            errors[key] = "Type invalide"
+
+            continue
+
+        if "min" in rule:
+
+            if t in ("int", "float"):
+
+                if val < rule["min"]:
+
+                    errors[key] = "Min " + str(rule["min"])
+
+            else:
+
+                if len(str(val)) < rule["min"]:
+
+                    errors[key] = "Min " + str(rule["min"])
+
+        if "max" in rule:
+
+            if t in ("int", "float"):
+
+                if val > rule["max"]:
+
+                    errors[key] = "Max " + str(rule["max"])
+
+        out[key] = val
+
+    if errors:
+
+        raise ValidationError(errors)
+
+    return out
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# RATE LIMITER
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+class RateLimiter:
+
+    def __init__(self, max_per_min=RATE_LIMIT_PER_MIN):
+
+        self.max_per_min = max_per_min
+
+        self.buckets = defaultdict(deque)
+
+        self.lock = threading.Lock()
+
+
+
+    def check(self, ip):
+
+        now = time.time()
+
+        with self.lock:
+
+            b = self.buckets[ip]
+
+            while b and now - b[0] > 60:
+
+                b.popleft()
+
+            if len(b) >= self.max_per_min:
+
+                return False
+
+            b.append(now)
+
+            return True
+
+
+
+
+
+RATE = RateLimiter()
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# METRICS
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+class Metrics:
+
+    def __init__(self):
+
+        self.lock = threading.RLock()
+
+        self.requests = 0
+
+        self.errors = 0
+
+        self.status_codes = defaultdict(int)
+
+        self.latencies = deque(maxlen=5000)
+
+        self.started = time.time()
+
+
+
+    def record(self, status, latency):
+
+        with self.lock:
+
+            self.requests += 1
+
+            self.status_codes[status] += 1
+
+            if status >= 400:
+
+                self.errors += 1
+
+            self.latencies.append(latency)
+
+
+
+    def percentile(self, p):
+
+        with self.lock:
+
+            if not self.latencies:
+
+                return 0.0
+
+            s = sorted(self.latencies)
+
+            k = min(int(len(s) * p / 100.0), len(s) - 1)
+
+            return round(s[k] * 1000, 2)
+
+
+
+    def stats(self):
+
+        with self.lock:
+
+            n = len(self.latencies)
+
+            avg = round(sum(self.latencies) / n * 1000, 2) if n else 0.0
+
+            return {
+
+                "uptime_s": round(time.time() - self.started, 1),
+
+                "requests": self.requests,
+
+                "errors": self.errors,
+
+                "error_rate": round(self.errors / self.requests * 100, 2) if self.requests else 0.0,
+
+                "avg_ms": avg,
+
+                "p50_ms": self.percentile(50),
+
+                "p95_ms": self.percentile(95),
+
+                "p99_ms": self.percentile(99),
+
+                "max_ms": round(max(self.latencies) * 1000, 2) if n else 0.0,
+
+                "status_codes": dict(self.status_codes),
+
+            }
+
+
+
+    def prometheus(self):
+
+        with self.lock:
+
+            lines = [
+
+                "# HELP nexus_requests_total Total requests",
+
+                "# TYPE nexus_requests_total counter",
+
+                "nexus_requests_total " + str(self.requests),
+
+                "# HELP nexus_errors_total Total errors",
+
+                "# TYPE nexus_errors_total counter",
+
+                "nexus_errors_total " + str(self.errors),
+
+                "# HELP nexus_uptime_seconds Uptime",
+
+                "# TYPE nexus_uptime_seconds gauge",
+
+                "nexus_uptime_seconds " + str(round(time.time() - self.started, 1)),
+
+                "# HELP nexus_latency_p50_ms P50",
+
+                "# TYPE nexus_latency_p50_ms gauge",
+
+                "nexus_latency_p50_ms " + str(self.percentile(50)),
+
+                "# HELP nexus_latency_p95_ms P95",
+
+                "# TYPE nexus_latency_p95_ms gauge",
+
+                "nexus_latency_p95_ms " + str(self.percentile(95)),
+
+                "# HELP nexus_latency_p99_ms P99",
+
+                "# TYPE nexus_latency_p99_ms gauge",
+
+                "nexus_latency_p99_ms " + str(self.percentile(99)),
+
+            ]
+
+            for code, count in self.status_codes.items():
+
+                lines.append('nexus_http_status{code="' + str(code) + '"} ' + str(count))
+
+            return "\n".join(lines) + "\n"
+
+
+
+    def reset(self):
+
+        with self.lock:
+
+            self.requests = 0
+
+            self.errors = 0
+
+            self.status_codes.clear()
+
+            self.latencies.clear()
+
+            self.started = time.time()
+
+
+
+
+
+METRICS = Metrics()
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# SSE
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+class SSEBroadcaster:
+
+    def __init__(self):
+
+        self.clients = []
+
+        self.lock = threading.RLock()
+
+        self.recent = deque(maxlen=200)
+
+
+
+    def register(self):
+
+        q = queue.Queue(maxsize=32)
+
+        with self.lock:
+
+            self.clients.append(q)
+
+        return q
+
+
+
+    def unregister(self, q):
+
+        with self.lock:
+
+            try:
+
+                self.clients.remove(q)
+
+            except ValueError:
+
+                pass
+
+
+
+    def broadcast(self, event, data):
+
+        payload = {
+
+            "event": event,
+
+            "data": data,
+
+            "ts": datetime.now(timezone.utc).isoformat(),
+
+        }
+
+        with self.lock:
+
+            self.recent.append(payload)
+
+            clients = list(self.clients)
+
+        for q in clients:
+
+            try:
+
+                q.put_nowait(payload)
+
+            except queue.Full:
+
+                pass
+
+
+
+    def events(self):
+
+        with self.lock:
+
+            return list(self.recent)
+
+
+
+    def count(self):
+
+        with self.lock:
+
+            return len(self.clients)
+
+
+
+
+
+SSE = SSEBroadcaster()
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# WEBSOCKET
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+
+
+
+def ws_handshake_key(key):
+
+    return base64.b64encode(hashlib.sha1((key + WS_MAGIC).encode()).digest()).decode()
+
+
+
+
+
+def ws_encode_frame(payload, opcode=0x1):
+
+    if isinstance(payload, str):
+
+        payload = payload.encode("utf-8")
+
+    length = len(payload)
+
+    frame = bytearray()
+
+    frame.append(0x80 | opcode)
+
+    if length < 126:
+
+        frame.append(length)
+
+    elif length < 65536:
+
+        frame.append(126)
+
+        frame.extend(struct.pack(">H", length))
+
+    else:
+
+        frame.append(127)
+
+        frame.extend(struct.pack(">Q", length))
+
+    frame.extend(payload)
+
+    return bytes(frame)
+
+
+
+
+
+def ws_decode_frame(data):
+
+    if len(data) < 2:
+
+        return None, 0
+
+    b1, b2 = data[0], data[1]
+
+    opcode = b1 & 0x0F
+
+    masked = b2 & 0x80
+
+    length = b2 & 0x7F
+
+    offset = 2
+
+    if length == 126:
+
+        length = struct.unpack(">H", data[2:4])[0]
+
+        offset = 4
+
+    elif length == 127:
+
+        length = struct.unpack(">Q", data[2:10])[0]
+
+        offset = 10
+
+    if masked:
+
+        mask = data[offset:offset + 4]
+
+        offset += 4
+
+    else:
+
+        mask = None
+
+    payload = data[offset:offset + length]
+
+    if mask:
+
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+    return payload, opcode
+
+
+
+
+
+class WSConn:
+
+    _counter = 0
+
+    _lock = threading.Lock()
+
+
+
+    def __init__(self, sock, addr):
+
+        with WSConn._lock:
+
+            WSConn._counter += 1
+
+            self.id = "ws-" + str(WSConn._counter)
+
+        self.sock = sock
+
+        self.addr = addr
+
+
+
+    def send(self, msg):
+
+        try:
+
+            self.sock.sendall(ws_encode_frame(msg))
+
+        except Exception:
+
+            pass
+
+
+
+
+
+class WSManager:
+
+    def __init__(self):
+
+        self.clients = []
+
+        self.lock = threading.RLock()
+
+
+
+    def add(self, conn):
+
+        with self.lock:
+
+            self.clients.append(conn)
+
+
+
+    def remove(self, conn):
+
+        with self.lock:
+
+            try:
+
+                self.clients.remove(conn)
+
+            except ValueError:
+
+                pass
+
+
+
+    def broadcast(self, msg):
+
+        with self.lock:
+
+            for c in list(self.clients):
+
+                c.send(msg)
+
+
+
+    def count(self):
+
+        with self.lock:
+
+            return len(self.clients)
+
+
+
+
+
+WS = WSManager()
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# HELPERS
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+def esc(s):
+
+    if s is None:
+
+        return ""
+
+    return html.escape(str(s), quote=True)
+
+
+
+
+
+CSS = """
+
+*{margin:0;padding:0;box-sizing:border-box}
+
+:root{--bg:#0a0a0f;--card:#14141f;--bd:#26263a;--tx:#e6e9f2;--dim:#7d8590;
+
+--or:#c8a45c;--cy:#00d4ff;--ro:#ff6ec7;--gr:#00ff9d;--ok:#3fb950;--err:#f85149;
+
+--mono:ui-monospace,monospace}
+
+body{background:var(--bg);color:var(--tx);font-family:-apple-system,sans-serif;
+
+line-height:1.6;min-height:100vh}
+
+.nav{background:#101018;border-bottom:1px solid var(--bd);padding:14px 24px;
+
+display:flex;gap:8px;align-items:center;flex-wrap:wrap;position:sticky;top:0;z-index:100}
+
+.nav .logo{color:var(--or);font-size:20px;font-weight:900;margin-right:20px;text-decoration:none}
+
+.nav a{padding:6px 12px;border-radius:6px;color:var(--tx);font-size:14px;text-decoration:none}
+
+.nav a:hover{background:var(--card);color:var(--or)}
+
+.nav a.active{background:var(--card);color:var(--or);font-weight:600}
+
+.container{max-width:1180px;margin:0 auto;padding:24px}
+
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:24px;margin-bottom:20px}
+
+h1{color:var(--or);font-size:28px;margin-bottom:12px;font-weight:800}
+
+h2{color:var(--cy);font-size:20px;margin-bottom:10px}
+
+h3{color:var(--ro);font-size:16px;margin-bottom:8px}
+
+p{color:var(--tx);margin-bottom:10px}
+
+a{color:var(--cy);text-decoration:none}
+
+a:hover{color:var(--ro)}
+
+code{background:#000;color:var(--gr);padding:2px 6px;border-radius:4px;font-family:var(--mono);font-size:13px}
+
+pre{background:#000;color:var(--gr);padding:16px;border-radius:8px;overflow-x:auto;
+
+font-family:var(--mono);font-size:12px;margin:12px 0;border:1px solid var(--bd);max-height:500px;overflow-y:auto}
+
+button,.btn{background:linear-gradient(135deg,var(--or),var(--ro));color:#000;
+
+border:none;padding:10px 20px;border-radius:8px;font-weight:700;cursor:pointer;
+
+font-size:14px;display:inline-block;margin:4px 4px 4px 0;text-decoration:none;font-family:inherit}
+
+button:hover,.btn:hover{transform:translateY(-2px);box-shadow:0 8px 30px rgba(200,164,92,.3)}
+
+.btn.secondary{background:transparent;color:var(--cy);border:1px solid var(--cy)}
+
+.btn.secondary:hover{background:var(--cy);color:#000}
+
+.btn.danger{background:var(--err);color:#fff}
+
+input,textarea{background:#000;border:1px solid var(--bd);color:var(--tx);
+
+padding:10px 14px;border-radius:6px;font-size:14px;width:100%;margin-bottom:10px;font-family:inherit}
+
+input:focus,textarea:focus{outline:none;border-color:var(--cy)}
+
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin:20px 0}
+
+.stat{background:#101018;border:1px solid var(--bd);border-radius:8px;padding:16px;text-align:center}
+
+.stat .n{font-size:26px;font-weight:900;color:var(--or);font-family:var(--mono);display:block;line-height:1}
+
+.stat .l{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-top:6px;font-weight:600}
+
+table{width:100%;border-collapse:collapse;margin:16px 0;font-size:14px}
+
+th,td{padding:10px 14px;text-align:left;border-bottom:1px solid var(--bd)}
+
+th{background:#101018;color:var(--cy);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:1px}
+
+.badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:600;
+
+background:rgba(0,212,255,.1);color:var(--cy);border:1px solid rgba(0,212,255,.3);margin-right:6px}
+
+.badge.success{background:rgba(63,185,80,.15);color:var(--ok);border-color:rgba(63,185,80,.3)}
+
+.badge.danger{background:rgba(248,81,73,.15);color:var(--err);border-color:rgba(248,81,73,.3)}
+
+.alert{padding:12px 16px;border-radius:8px;margin:12px 0;border:1px solid}
+
+.alert.danger{background:rgba(248,81,73,.08);border-color:var(--err);color:var(--err)}
+
+.alert.success{background:rgba(63,185,80,.08);border-color:var(--ok);color:var(--ok)}
+
+footer{text-align:center;padding:32px 20px;color:var(--dim);font-size:12px;
+
+margin-top:40px;border-top:1px solid var(--bd);font-family:var(--mono)}
+
+footer strong{color:var(--or)}
+
+"""
+
+
+
+
+
+def main_layout(content, ctx):
+
+    user = ctx.get("user")
+
+    path = ctx.get("path", "/")
+
+    if user:
+
+        auth_html = ('<span style="color:var(--or);font-weight:700">👤 '
+
+                     + esc(user.get("username", "?")) + '</span> '
+
+                     '<a href="/logout" class="btn secondary" style="padding:5px 10px;font-size:12px">Logout</a>')
+
+    else:
+
+        auth_html = ('<a href="/login" class="btn secondary" style="padding:5px 10px;font-size:12px">Login</a> '
+
+                     '<a href="/register" class="btn" style="padding:5px 10px;font-size:12px">Register</a>')
+
+    nav_items = [
+
+        ("/", "🏠 Accueil"), ("/routes", "📋 Routes"),
+
+        ("/metrics", "📊 Métriques"), ("/cache", "💾 Cache"),
+
+        ("/state", "🧠 État"), ("/events", "📡 Events"),
+
+        ("/ws", "🔌 WS"), ("/graphql", "🔮 GraphQL"),
+
+        ("/bench", "⚡ Bench"), ("/health", "❤️ Health"),
+
+    ]
+
+    nav = "".join(
+
+        '<a href="' + h + '" class="' + ("active" if path == h else "") + '">' + l + '</a>'
+
+        for h, l in nav_items)
+
+    return ('<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
+
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+
+            '<title>NEXUS ROUTER v' + VERSION + '</title>'
+
+            '<style>' + CSS + '</style></head><body>'
+
+            '<nav class="nav"><a href="/" class="logo">⚡ NEXUS v5</a>'
+
+            + nav + '<div style="flex:1"></div>' + auth_html + '</nav>'
+
+            '<main class="container">' + content + '</main>'
+
+            '<footer><strong>NEXUS ROUTER v' + VERSION + '</strong><br>'
+
+            'Localhost : http://' + HOST + ':' + str(PORT) + '<br>'
+
+            + AUTEUR + ' · ' + LICENCE + '</footer>'
+
+            '</body></html>')
+
+
+
+
+
+def render(content, ctx, layout="main"):
+
+    if layout == "none":
+
+        return content
+
+    return main_layout(content, ctx)
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# PAGES
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+def page_home(ctx):
+
+    m = METRICS.stats()
+
+    c1 = CACHE_1.stats()
+
+    c2 = CACHE_2.stats()
+
+    return render(
+
+        '<div class="card"><h1>⚡ NEXUS ROUTER v' + VERSION + '</h1>'
+
+        '<p>Framework web Python full-stack. Zéro dépendance. Localhost pur.</p>'
+
+        '<p><span class="badge success">v' + VERSION + '</span>'
+
+        '<span class="badge">Radix Tree</span>'
+
+        '<span class="badge">WebSocket</span>'
+
+        '<span class="badge">SSE</span>'
+
+        '<span class="badge">ORM</span>'
+
+        '<span class="badge">GraphQL</span></p></div>'
+
+
+
+        '<div class="card"><h2>📊 Métriques temps réel</h2>'
+
+        '<div class="stats">'
+
+        '<div class="stat"><span class="n">' + str(m["requests"]) + '</span><span class="l">Requêtes</span></div>'
+
+        '<div class="stat"><span class="n">' + str(m["errors"]) + '</span><span class="l">Erreurs</span></div>'
+
+        '<div class="stat"><span class="n">' + str(m["avg_ms"]) + 'ms</span><span class="l">Moyenne</span></div>'
+
+        '<div class="stat"><span class="n">' + str(m["p95_ms"]) + 'ms</span><span class="l">p95</span></div>'
+
+        '<div class="stat"><span class="n">' + str(c1["hit_rate"]) + '%</span><span class="l">L1 hits</span></div>'
+
+        '<div class="stat"><span class="n">' + str(SESSIONS.count()) + '</span><span class="l">Sessions</span></div>'
+
+        '<div class="stat"><span class="n">' + str(WS.count()) + '</span><span class="l">WS clients</span></div>'
+
+        '<div class="stat"><span class="n">' + str(SSE.count()) + '</span><span class="l">SSE clients</span></div>'
+
+        '</div></div>'
+
+
+
+        '<div class="card"><h2>🚀 Test rapide</h2>'
+
+        '<a href="/routes" class="btn">📋 Routes</a>'
+
+        '<a href="/metrics" class="btn secondary">📊 Métriques</a>'
+
+        '<a href="/ws" class="btn secondary">🔌 WebSocket</a>'
+
+        '<a href="/graphql" class="btn secondary">🔮 GraphQL</a>'
+
+        '<a href="/events" class="btn secondary">📡 Events</a>'
+
+        '<a href="/bench" class="btn secondary">⚡ Bench</a>'
+
+        '<a href="/user/dgk" class="btn secondary">👤 /user/dgk</a>'
+
+        '<a href="/api/status" class="btn secondary">🔌 API</a>'
+
+        '<a href="/metrics/prometheus" class="btn secondary">📈 Prometheus</a>'
+
+        '<a href="/test/404" class="btn danger">🧪 404</a>'
+
+        '<a href="/test/500" class="btn danger">🧪 500</a>'
+
+        '</div>', ctx)
+
+
+
+
+
+def page_routes(ctx):
+
+    rows = ""
+
+    for r in ROUTER.routes:
+
+        rows += ('<tr><td><code>' + esc(r["path"]) + '</code></td>'
+
+                 '<td>' + esc(",".join(r["methods"])) + '</td>'
+
+                 '<td>' + esc(r["description"] or "—") + '</td>'
+
+                 '<td>' + esc(r["group"] or "—") + '</td></tr>')
+
+    return render('<div class="card"><h1>📋 Routes (' + str(len(ROUTER.routes)) + ')</h1>'
+
+                  '<table><thead><tr><th>Path</th><th>Méthodes</th>'
+
+                  '<th>Description</th><th>Groupe</th></tr></thead>'
+
+                  '<tbody>' + rows + '</tbody></table></div>', ctx)
+
+
+
+
+
+def page_metrics(ctx):
+
+    m = METRICS.stats()
+
+    status_rows = "".join(
+
+        '<tr><td><code>' + str(k) + '</code></td><td>' + str(v) + '</td></tr>'
+
+        for k, v in sorted(m["status_codes"].items()))
+
+    return render(
+
+        '<div class="card"><h1>📊 Métriques</h1>'
+
+        '<div class="stats">'
+
+        '<div class="stat"><span class="n">' + str(m["uptime_s"]) + 's</span><span class="l">Uptime</span></div>'
+
+        '<div class="stat"><span class="n">' + str(m["requests"]) + '</span><span class="l">Requêtes</span></div>'
+
+        '<div class="stat"><span class="n">' + str(m["error_rate"]) + '%</span><span class="l">Erreurs</span></div>'
+
+        '<div class="stat"><span class="n">' + str(m["avg_ms"]) + 'ms</span><span class="l">Moyenne</span></div>'
+
+        '<div class="stat"><span class="n">' + str(m["p50_ms"]) + 'ms</span><span class="l">p50</span></div>'
+
+        '<div class="stat"><span class="n">' + str(m["p95_ms"]) + 'ms</span><span class="l">p95</span></div>'
+
+        '<div class="stat"><span class="n">' + str(m["p99_ms"]) + 'ms</span><span class="l">p99</span></div>'
+
+        '<div class="stat"><span class="n">' + str(m["max_ms"]) + 'ms</span><span class="l">Max</span></div>'
+
+        '</div>'
+
+        '<h2 style="margin-top:20px">Status codes</h2>'
+
+        '<table><thead><tr><th>Code</th><th>Count</th></tr></thead>'
+
+        '<tbody>' + status_rows + '</tbody></table>'
+
+        '<a href="/metrics/prometheus" class="btn secondary">📈 Prometheus</a> '
+
+        '<form method="POST" action="/metrics/reset" style="display:inline">'
+
+        '<button type="submit" class="btn danger">Reset</button></form>'
+
+        '</div>', ctx)
+
+
+
+
+
+def page_cache(ctx):
+
+    c1 = CACHE_1.stats()
+
+    c2 = CACHE_2.stats()
+
+    return render(
+
+        '<div class="card"><h1>💾 Cache</h1>'
+
+        '<h2>L1 (mémoire)</h2><div class="stats">'
+
+        '<div class="stat"><span class="n">' + str(c1["size"]) + '</span><span class="l">Entrées</span></div>'
+
+        '<div class="stat"><span class="n">' + str(c1["hit_rate"]) + '%</span><span class="l">Hit rate</span></div>'
+
+        '<div class="stat"><span class="n">' + str(c1["hits"]) + '</span><span class="l">Hits</span></div>'
+
+        '<div class="stat"><span class="n">' + str(c1["misses"]) + '</span><span class="l">Misses</span></div>'
+
+        '</div>'
+
+        '<h2>L2 (disque)</h2><div class="stats">'
+
+        '<div class="stat"><span class="n">' + str(c2["files"]) + '</span><span class="l">Fichiers</span></div>'
+
+        '<div class="stat"><span class="n">' + str(c2["size_mb"]) + 'MB</span><span class="l">Taille</span></div>'
+
+        '<div class="stat"><span class="n">' + str(c2["hit_rate"]) + '%</span><span class="l">Hit rate</span></div>'
+
+        '</div>'
+
+        '<form method="POST" action="/cache/clear" style="margin-top:20px">'
+
+        '<button type="submit" class="btn danger">Vider les caches</button></form>'
+
+        '</div>', ctx)
+
+
+
+
+
+def page_state(ctx):
+
+    try:
+
+        users = DB.fetchall("SELECT username, email, created_at FROM users ORDER BY id DESC LIMIT 20")
+
+        rows = ""
+
+        for u in users:
+
+            rows += ('<tr><td>' + esc(u["username"]) + '</td>'
+
+                     '<td>' + esc(u["email"] or "—") + '</td>'
+
+                     '<td>' + datetime.fromtimestamp(u["created_at"]).strftime("%Y-%m-%d %H:%M") + '</td></tr>')
+
+    except Exception as e:
+
+        rows = '<tr><td colspan="3">Erreur : ' + esc(e) + '</td></tr>'
+
+    return render(
+
+        '<div class="card"><h1>🧠 État</h1>'
+
+        '<div class="stats">'
+
+        '<div class="stat"><span class="n">' + str(SESSIONS.count()) + '</span><span class="l">Sessions</span></div>'
+
+        '<div class="stat"><span class="n">' + str(DB.fetchone("SELECT COUNT(*) as c FROM users")["c"]) + '</span><span class="l">Users</span></div>'
+
+        '<div class="stat"><span class="n">' + str(DB.fetchone("SELECT COUNT(*) as c FROM visits")["c"]) + '</span><span class="l">Visits</span></div>'
+
+        '<div class="stat"><span class="n">' + str(BASE) + '</span><span class="l">Base</span></div>'
+
+        '</div>'
+
+        '<h2>Users</h2>'
+
+        '<table><thead><tr><th>Username</th><th>Email</th><th>Créé</th></tr></thead>'
+
+        '<tbody>' + rows + '</tbody></table></div>', ctx)
+
+
+
+
+
+def page_events(ctx):
+
+    return render(
+
+        '<div class="card"><h1>📡 Events SSE</h1>'
+
+        '<p>Flux temps réel. <a href="/api/events/stream" target="_blank">Ouvrir stream</a></p>'
+
+        '<div id="live" style="max-height:500px;overflow-y:auto"></div></div>'
+
+        '<script>'
+
+        'var es=new EventSource("/api/events/stream");'
+
+        'es.onmessage=function(e){'
+
+        'try{var d=JSON.parse(e.data);'
+
+        'var el=document.getElementById("live");'
+
+        'var div=document.createElement("div");'
+
+        'div.style.cssText="border-left:3px solid #00d4ff;padding:8px 12px;'
+
+        'background:rgba(0,212,255,.05);border-radius:0 6px 6px 0;margin-bottom:6px;font-size:13px";'
+
+        'div.innerHTML="<b>"+d.event+"</b> <span style=\'color:#7d8590\'>"+d.ts+"</span><br>"'
+
+        '+ "<code>"+JSON.stringify(d.data).slice(0,200)+"</code>";'
+
+        'el.insertBefore(div,el.firstChild);'
+
+        'while(el.children.length>100)el.removeChild(el.lastChild);'
+
+        '}catch(x){}};'
+
+        '</script>', ctx)
+
+
+
+
+
+def page_ws(ctx):
+
+    return render(
+
+        '<div class="card"><h1>🔌 WebSocket</h1>'
+
+        '<p>Test WebSocket natif. Envoie un message.</p>'
+
+        '<input type="text" id="msg" placeholder="Message...">'
+
+        '<button onclick="send()">Envoyer</button>'
+
+        '<div id="log" style="background:#000;border:1px solid #26263a;'
+
+        'border-radius:8px;padding:14px;font-family:monospace;font-size:12px;'
+
+        'color:#00ff9d;height:300px;overflow-y:auto;margin-top:12px"></div></div>'
+
+        '<script>'
+
+        'var ws=null,log=document.getElementById("log");'
+
+        'function add(s){log.innerHTML+="<div>"+s+"</div>";log.scrollTop=log.scrollHeight;}'
+
+        'function connect(){'
+
+        'var proto=location.protocol==="https:"?"wss://":"ws://";'
+
+        'ws=new WebSocket(proto+location.host+"/ws/echo");'
+
+        'ws.onopen=function(){add("[open] connecté");};'
+
+        'ws.onmessage=function(e){add("[recv] "+e.data);};'
+
+        'ws.onclose=function(){add("[close] reconnexion 2s");setTimeout(connect,2000);};'
+
+        'ws.onerror=function(){add("[error]");};'
+
+        '}'
+
+        'function send(){'
+
+        'if(ws&&ws.readyState===1){var m=document.getElementById("msg").value;ws.send(m);add("[send] "+m);}'
+
+        '}'
+
+        'connect();'
+
+        '</script>', ctx)
+
+
+
+
+
+def page_graphql(ctx):
+
+    return render(
+
+        '<div class="card"><h1>🔮 GraphQL</h1>'
+
+        '<p>Essayez : <code>{ stats }</code> ou <code>{ users }</code></p>'
+
+        '<textarea id="q">{ stats }</textarea>'
+
+        '<button onclick="run()">Exécuter</button>'
+
+        '<pre id="out">En attente...</pre></div>'
+
+        '<script>'
+
+        'async function run(){'
+
+        'var q=document.getElementById("q").value;'
+
+        'var r=await fetch("/graphql",{method:"POST",headers:{"Content-Type":"application/json"},'
+
+        'body:JSON.stringify({query:q})});'
+
+        'var d=await r.json();'
+
+        'document.getElementById("out").textContent=JSON.stringify(d,null,2);'
+
+        '}'
+
+        'run();'
+
+        '</script>', ctx)
+
+
+
+
+
+def page_bench(ctx):
+
+    n = 2000
+
+    tests = [
+
+        ("hashlib.sha256", lambda: hashlib.sha256(b"hello").hexdigest()),
+
+        ("json.dumps", lambda: json.dumps({"a": 1, "b": [1, 2, 3]})),
+
+        ("zlib.compress", lambda: zlib.compress(b"x" * 1000)),
+
+        ("base64", lambda: base64.b64encode(b"hello world")),
+
+        ("uuid4", lambda: str(uuid.uuid4())),
+
+        ("jwt_encode", lambda: jwt_encode({"sub": "test"})),
+
+    ]
+
+    rows = ""
+
+    for name, fn in tests:
+
+        t0 = time.perf_counter()
+
+        for _ in range(n):
+
+            fn()
+
+        t1 = time.perf_counter()
+
+        total = (t1 - t0) * 1000
+
+        per = total / n * 1000
+
+        rows += ('<tr><td><code>' + name + '</code></td>'
+
+                 '<td>' + str(round(total, 2)) + ' ms</td>'
+
+                 '<td>' + str(round(per, 3)) + ' µs</td></tr>')
+
+    return render(
+
+        '<div class="card"><h1>⚡ Benchmark local</h1>'
+
+        '<p>' + str(n) + ' itérations par test.</p>'
+
+        '<table><thead><tr><th>Test</th><th>Total</th><th>Par op</th></tr></thead>'
+
+        '<tbody>' + rows + '</tbody></table></div>', ctx)
+
+
+
+
+
+def page_health(ctx):
+
+    checks = {}
+
+    try:
+
+        DB.fetchone("SELECT 1")
+
+        checks["database"] = (True, "sqlite accessible")
+
+    except Exception as e:
+
+        checks["database"] = (False, str(e)[:80])
+
+    try:
+
+        fp = BASE / ".h"
+
+        fp.write_text("ok")
+
+        fp.unlink()
+
+        checks["disk"] = (True, str(BASE))
+
+    except Exception as e:
+
+        checks["disk"] = (False, str(e)[:80])
+
+    checks["cache"] = (True, str(CACHE_1.stats()["size"]) + " entrées L1")
+
+    checks["sessions"] = (True, str(SESSIONS.count()) + " sessions")
+
+    checks["ws"] = (True, str(WS.count()) + " clients WS")
+
+    all_ok = all(v[0] for v in checks.values())
+
+    rows = ""
+
+    for name, (ok_, detail) in checks.items():
+
+        badge = "success" if ok_ else "danger"
+
+        rows += ('<tr><td><code>' + name + '</code></td>'
+
+                 '<td><span class="badge ' + badge + '">' + ("OK" if ok_ else "KO") + '</span></td>'
+
+                 '<td>' + esc(detail) + '</td></tr>')
+
+    return render(
+
+        '<div class="card"><h1>❤️ Health</h1>'
+
+        '<p>Status : <span class="badge ' + ("success" if all_ok else "danger")
+
+        + '">' + ("HEALTHY" if all_ok else "DEGRADED") + '</span></p>'
+
+        '<table><thead><tr><th>Check</th><th>État</th><th>Détail</th></tr></thead>'
+
+        '<tbody>' + rows + '</tbody></table></div>', ctx)
+
+
+
+
+
+def page_user(ctx):
+
+    p = ctx.get("params", {})
+
+    name = p.get("name", "?")
+
+    pid = p.get("id")
+
+    extra = '<p>Post ID : <code>' + esc(pid) + '</code></p>' if pid else ""
+
+    return render(
+
+        '<div class="card"><h1>👤 ' + esc(name) + '</h1>'
+
+        '<p>Path : <code>' + esc(ctx.get("path", "")) + '</code></p>'
+
+        '<p>Param name = <code>' + esc(name) + '</code></p>'
+
+        + extra + '</div>', ctx)
+
+
+
+
+
+def page_login(ctx):
+
+    err = ctx.get("error", "")
+
+    err_html = '<div class="alert danger">' + esc(err) + '</div>' if err else ""
+
+    return render(
+
+        '<div class="card" style="max-width:400px;margin:40px auto">'
+
+        '<h1>🔐 Connexion</h1>' + err_html +
+
+        '<form method="POST" action="/login">'
+
+        '<input type="text" name="username" placeholder="Nom" required>'
+
+        '<input type="password" name="password" placeholder="Mot de passe" required>'
+
+        '<button type="submit" class="btn" style="width:100%">Se connecter</button></form>'
+
+        '<p style="text-align:center;margin-top:16px;color:#7d8590;font-size:13px">'
+
+        'Pas de compte ? <a href="/register">Inscription</a></p></div>', ctx)
+
+
+
+
+
+def page_register(ctx):
+
+    err = ctx.get("error", "")
+
+    err_html = '<div class="alert danger">' + esc(err) + '</div>' if err else ""
+
+    return render(
+
+        '<div class="card" style="max-width:400px;margin:40px auto">'
+
+        '<h1>📝 Inscription</h1>' + err_html +
+
+        '<form method="POST" action="/register">'
+
+        '<input type="text" name="username" placeholder="Nom (min 3)" required minlength="3">'
+
+        '<input type="password" name="password" placeholder="Mot de passe (min 6)" required minlength="6">'
+
+        '<button type="submit" class="btn" style="width:100%">Créer</button></form></div>', ctx)
+
+
+
+
+
+def page_test_404(ctx):
+
+    raise NotFound()
+
+
+
+
+
+def page_test_500(ctx):
+
+    raise HTTPError(500, "Erreur test")
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ROUTES
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+ROUTER.add("/", page_home, description="Accueil", group="core")
+
+ROUTER.add("/routes", page_routes, description="Routes", group="core")
+
+ROUTER.add("/metrics", page_metrics, description="Métriques", group="core")
+
+ROUTER.add("/cache", page_cache, description="Cache", group="core")
+
+ROUTER.add("/state", page_state, description="État", group="core")
+
+ROUTER.add("/events", page_events, description="Events SSE", group="core")
+
+ROUTER.add("/ws", page_ws, description="WebSocket", group="core")
+
+ROUTER.add("/graphql", page_graphql, description="GraphQL", group="core")
+
+ROUTER.add("/bench", page_bench, description="Bench", group="core")
+
+ROUTER.add("/health", page_health, description="Health", group="core")
+
+ROUTER.add("/login", page_login, description="Login", group="auth")
+
+ROUTER.add("/register", page_register, description="Register", group="auth")
+
+ROUTER.add("/user/:name", page_user, description="User", group="user")
+
+ROUTER.add("/user/:name/posts/:id", page_user, description="Post", group="user")
+
+ROUTER.add("/test/404", page_test_404, description="Test 404", group="test")
+
+ROUTER.add("/test/500", page_test_500, description="Test 500", group="test")
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# HTTP HANDLER
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+
+    server_version = "NexusRouter/" + VERSION
+
+    protocol_version = "HTTP/1.1"
+
+
+
+    def log_message(self, *a):
+
+        pass
+
+
+
+    def _cookies(self):
+
+        c = {}
+
+        for part in self.headers.get("Cookie", "").split(";"):
+
+            if "=" in part:
+
+                k, v = part.split("=", 1)
+
+                c[k.strip()] = urllib.parse.unquote(v.strip())
+
+        return c
+
+
+
+    def _send(self, code, body, ctype="text/html; charset=utf-8", cookies=None, extra=None):
+
+        if isinstance(body, str):
+
+            body = body.encode("utf-8")
+
+        headers_out = {}
+
+        if ENABLE_GZIP and len(body) > 500:
+
+            ae = self.headers.get("Accept-Encoding", "")
+
+            if "gzip" in ae:
+
+                buf = io.BytesIO()
+
+                with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+
+                    gz.write(body)
+
+                comp = buf.getvalue()
+
+                if len(comp) < len(body):
+
+                    body = comp
+
+                    headers_out["Content-Encoding"] = "gzip"
+
+        if ENABLE_ETAG:
+
+            etag = '"' + hashlib.md5(body).hexdigest()[:16] + '"'
+
+            if self.headers.get("If-None-Match") == etag:
+
+                self.send_response(304)
+
+                self.send_header("ETag", etag)
+
+                self.end_headers()
+
+                return
+
+            headers_out["ETag"] = etag
+
+        try:
+
+            self.send_response(code)
+
+            self.send_header("Content-Type", ctype)
+
+            self.send_header("Content-Length", str(len(body)))
+
+            self.send_header("X-Powered-By", "NexusRouter/" + VERSION)
+
+            for k, v in headers_out.items():
+
+                self.send_header(k, v)
+
+            if extra:
+
+                for k, v in extra.items():
+
+                    self.send_header(k, v)
+
+            if cookies:
+
+                for c in cookies:
+
+                    self.send_header("Set-Cookie", c)
+
+            self.end_headers()
+
+            self.wfile.write(body)
+
+        except (BrokenPipeError, ConnectionResetError):
+
+            pass
+
+
+
+    def _json(self, code, obj, extra=None):
+
+        body = json.dumps(obj, indent=2, ensure_ascii=False, default=str)
+
+        self._send(code, body, "application/json; charset=utf-8", extra=extra)
+
+
+
+    def _redirect(self, url, cookies=None):
+
+        self.send_response(302)
+
+        self.send_header("Location", url)
+
+        if cookies:
+
+            for c in cookies:
+
+                self.send_header("Set-Cookie", c)
+
+        self.end_headers()
+
+
+
+    def _ctx(self, path, params=None, method="GET"):
+
+        return {
+
+            "path": path,
+
+            "params": params or {},
+
+            "method": method,
+
+            "ip": self.client_address[0] if self.client_address else "?",
+
+            "cookies": self._cookies(),
+
+            "headers": dict(self.headers),
+
+            "user": None,
+
+            "session": None,
+
+        }
+
+
+
+    def do_GET(self):
+
+        self._handle("GET")
+
+
+
+    def do_POST(self):
+
+        path = urllib.parse.urlparse(self.path).path
+
+        try:
+
+            n = int(self.headers.get("Content-Length", 0))
+
+            raw = self.rfile.read(n).decode("utf-8") if n else ""
+
+            ctype = self.headers.get("Content-Type", "")
+
+            if "application/json" in ctype:
+
+                body = json.loads(raw) if raw else {}
+
+                form = {k: [str(v)] for k, v in body.items()}
+
+            else:
+
+                form = urllib.parse.parse_qs(raw)
+
+        except Exception:
+
+            form = {}
+
+
+
+        def g(k):
+
+            return form.get(k, [""])[0].strip()
+
+
+
+        if path == "/login":
+
+            u, p = g("username"), g("password")
+
+            if not u or not p:
+
+                ctx = self._ctx("/login", method="POST")
+
+                ctx["error"] = "Champs vides"
+
+                return self._send(200, page_login(ctx))
+
+            row = DB.fetchone("SELECT * FROM users WHERE username = ?", (u,))
+
+            if row and verify_password(p, row["password_hash"]):
+
+                DB.execute("UPDATE users SET last_login=? WHERE id=?", (time.time(), row["id"]))
+
+                token = SESSIONS.create({"user": {"id": row["id"], "username": row["username"]}})
+
+                return self._redirect("/", cookies=[
+
+                    "session=" + token + "; Path=/; HttpOnly; Max-Age=" + str(SESSION_TTL)])
+
+            ctx = self._ctx("/login", method="POST")
+
+            ctx["error"] = "Identifiants invalides"
+
+            return self._send(200, page_login(ctx))
+
+
+
+        if path == "/register":
+
+            u, p = g("username"), g("password")
+
+            if len(u) < 3 or len(p) < 6:
+
+                ctx = self._ctx("/register", method="POST")
+
+                ctx["error"] = "Nom ≥ 3, mot de passe ≥ 6"
+
+                return self._send(200, page_register(ctx))
+
+            if DB.fetchone("SELECT id FROM users WHERE username = ?", (u,)):
+
+                ctx = self._ctx("/register", method="POST")
+
+                ctx["error"] = "Nom déjà pris"
+
+                return self._send(200, page_register(ctx))
+
+            uid = DB.insert(
+
+                "INSERT INTO users (username, password_hash, created_at) VALUES (?,?,?)",
+
+                (u, hash_password(p), time.time()))
+
+            token = SESSIONS.create({"user": {"id": uid, "username": u}})
+
+            return self._redirect("/", cookies=[
+
+                "session=" + token + "; Path=/; HttpOnly; Max-Age=" + str(SESSION_TTL)])
+
+
+
+        if path == "/logout":
+
+            c = self._cookies()
+
+            if "session" in c:
+
+                SESSIONS.destroy(c["session"])
+
+            return self._redirect("/", cookies=["session=; Path=/; Max-Age=0"])
+
+
+
+        if path == "/cache/clear":
+
+            CACHE_1.clear()
+
+            CACHE_2.clear()
+
+            return self._redirect("/cache")
+
+
+
+        if path == "/metrics/reset":
+
+            METRICS.reset()
+
+            return self._redirect("/metrics")
+
+
+
+        if path == "/graphql":
+
+            try:
+
+                body = json.loads(raw) if raw else {}
+
+            except Exception:
+
+                body = {}
+
+            query = body.get("query", "")
+
+            return self._json(200, self._graphql(query))
+
+
+
+        if path == "/api/auth/login":
+
+            u, p = g("username"), g("password")
+
+            row = DB.fetchone("SELECT * FROM users WHERE username = ?", (u,))
+
+            if row and verify_password(p, row["password_hash"]):
+
+                token = jwt_encode({"sub": u, "uid": row["id"]})
+
+                return self._json(200, {"ok": True, "token": token, "username": u})
+
+            return self._json(401, {"ok": False, "error": "invalid"})
+
+
+
+        self._send(404, "Not Found")
+
+
+
+    def _graphql(self, query):
+
+        query = query.strip()
+
+        m = re.match(r"\{\s*(\w+)\s*(?:\((.*?)\))?\s*\}", query)
+
+        if not m:
+
+            return {"errors": [{"message": "Query invalide"}]}
+
+        field = m.group(1)
+
+        if field == "users":
+
+            rows = DB.fetchall("SELECT id, username, email, created_at FROM users LIMIT 50")
+
+            return {"data": {"users": [dict(r) for r in rows]}}
+
+        if field == "stats":
+
+            return {"data": {"stats": {
+
+                "users": DB.fetchone("SELECT COUNT(*) as c FROM users")["c"],
+
+                "visits": DB.fetchone("SELECT COUNT(*) as c FROM visits")["c"],
+
+            }}}
+
+        return {"errors": [{"message": "Field inconnu : " + field}]}
+
+
+
+    def _handle(self, method):
+
+        path = urllib.parse.urlparse(self.path).path
+
+
+
+        # WebSocket upgrade
+
+        if ENABLE_WS and path == "/ws/echo" and \
+
+                self.headers.get("Upgrade", "").lower() == "websocket":
+
+            return self._ws_handshake()
+
+
+
+        # Prometheus
+
+        if path == "/metrics/prometheus":
+
+            return self._send(200, METRICS.prometheus(), "text/plain; version=0.0.4")
+
+
+
+        # API
+
+        if path == "/api/status":
+
+            return self._json(200, {
+
+                "version": VERSION,
+
+                "author": AUTEUR,
+
+                "host": HOST,
+
+                "port": PORT,
+
+                "uptime_s": round(time.time() - METRICS.started, 1),
+
+                "routes": len(ROUTER.routes),
+
+                "metrics": METRICS.stats(),
+
+                "cache": {"l1": CACHE_1.stats(), "l2": CACHE_2.stats()},
+
+                "sessions": SESSIONS.count(),
+
+                "ws_clients": WS.count(),
+
+                "sse_clients": SSE.count(),
+
+                "base": str(BASE),
+
+            })
+
+        if path in ("/health", "/api/health"):
+
+            return self._api_health()
+
+        if path in ("/ready", "/api/ready"):
+
+            return self._json(200, {"ready": True})
+
+        if path in ("/live", "/api/live"):
+
+            return self._json(200, {"live": True})
+
+        if path == "/api/routes":
+
+            return self._json(200, {"count": len(ROUTER.routes), "routes": ROUTER.routes})
+
+        if path == "/api/metrics":
+
+            return self._json(200, METRICS.stats())
+
+        if path == "/api/cache":
+
+            return self._json(200, {"l1": CACHE_1.stats(), "l2": CACHE_2.stats()})
+
+        if path == "/api/events":
+
+            return self._json(200, {"events": SSE.events()})
+
+        if path == "/api/events/stream":
+
+            return self._sse_stream()
+
+        if path == "/api/users":
+
+            rows = DB.fetchall("SELECT id, username, email, created_at FROM users")
+
+            return self._json(200, {"count": len(rows), "users": [dict(r) for r in rows]})
+
+
+
+        # Match route
+
+        match = ROUTER.match(path, method=method)
+
+        if not match:
+
+            ctx = self._ctx(path, method=method)
+
+            self._send(404, self._error_page(404, ctx))
+
+            METRICS.record(404, 0.0)
+
+            return
+
+
+
+        handler = match["handler"]
+
+        params = match.get("params", {})
+
+        t0 = time.time()
+
+        ctx = self._ctx(path, params, method)
+
+
+
+        try:
+
+            # Auth session
+
+            token = ctx["cookies"].get("session")
+
+            s = SESSIONS.get(token) if token else None
+
+            if s:
+
+                ctx["session"] = s
+
+                ctx["user"] = s.get("user")
+
+
+
+            # Cache
+
+            cache_key = method + ":" + path
+
+            body = None
+
+            if method == "GET":
+
+                body = CACHE_1.get(cache_key)
+
+                if body is None:
+
+                    body = CACHE_2.get(cache_key)
+
+                    if body is not None:
+
+                        CACHE_1.set(cache_key, body)
+
+
+
+            if body is None:
+
+                body = handler(ctx)
+
+                if isinstance(body, str) and not body.startswith("<!DOCTYPE"):
+
+                    body = render(body, ctx)
+
+                if method == "GET":
+
+                    CACHE_1.set(cache_key, body)
+
+                    CACHE_2.set(cache_key, body)
+
+
+
+            self._send(200, body, extra={
+
+                "X-Response-Time": "{:.1f}ms".format((time.time() - t0) * 1000),
+
+            })
+
+            METRICS.record(200, time.time() - t0)
+
+            SSE.broadcast("page_view", {"path": path})
+
+
+
+        except HTTPError as e:
+
+            body = self._error_page(e.status, ctx)
+
+            self._send(e.status, body)
+
+            METRICS.record(e.status, time.time() - t0)
+
+        except Exception as e:
+
+            ctx["error"] = str(e)
+
+            if DEBUG:
+
+                ctx["traceback"] = traceback.format_exc()
+
+            self._send(500, self._error_page(500, ctx))
+
+            METRICS.record(500, time.time() - t0)
+
+
+
+    def _api_health(self):
+
+        checks = {}
+
+        try:
+
+            DB.fetchone("SELECT 1")
+
+            checks["database"] = "ok"
+
+        except Exception as e:
+
+            checks["database"] = "error: " + str(e)[:80]
+
+        try:
+
+            fp = BASE / ".h"
+
+            fp.write_text("ok")
+
+            fp.unlink()
+
+            checks["disk"] = "ok"
+
+        except Exception as e:
+
+            checks["disk"] = "error: " + str(e)[:80]
+
+        checks["cache"] = "ok"
+
+        checks["sessions"] = "ok"
+
+        healthy = all(v == "ok" for v in checks.values())
+
+        return self._json(200 if healthy else 503, {
+
+            "healthy": healthy,
+
+            "checks": checks,
+
+            "uptime_s": round(time.time() - METRICS.started, 1),
+
+        })
+
+
+
+    def _sse_stream(self):
+
+        q = SSE.register()
+
+        try:
+
+            self.send_response(200)
+
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+
+            self.send_header("Cache-Control", "no-cache")
+
+            self.send_header("Connection", "keep-alive")
+
+            self.end_headers()
+
+            for e in SSE.events()[-10:]:
+
+                self.wfile.write(("data: " + json.dumps(e, ensure_ascii=False) + "\n\n").encode())
+
+            self.wfile.flush()
+
+            last_ka = time.time()
+
+            while True:
+
+                try:
+
+                    evt = q.get(timeout=2.0)
+
+                    self.wfile.write(("data: " + json.dumps(evt, ensure_ascii=False) + "\n\n").encode())
+
+                    self.wfile.flush()
+
+                    last_ka = time.time()
+
+                except queue.Empty:
+
+                    if time.time() - last_ka > 15:
+
+                        try:
+
+                            self.wfile.write(b": ping\n\n")
+
+                            self.wfile.flush()
+
+                        except Exception:
+
+                            break
+
+                        last_ka = time.time()
+
+        except (BrokenPipeError, ConnectionResetError):
+
+            pass
+
+        finally:
+
+            SSE.unregister(q)
+
+
+
+    def _ws_handshake(self):
+
+        key = self.headers.get("Sec-WebSocket-Key", "")
+
+        accept = ws_handshake_key(key)
+
+        conn = None
+
+        try:
+
+            self.send_response(101)
+
+            self.send_header("Upgrade", "websocket")
+
+            self.send_header("Connection", "Upgrade")
+
+            self.send_header("Sec-WebSocket-Accept", accept)
+
+            self.end_headers()
+
+            conn = WSConn(self.connection, self.client_address)
+
+            WS.add(conn)
+
+            conn.send("Bienvenue dans le WebSocket NEXUS")
+
+            while True:
+
+                try:
+
+                    raw = self.connection.recv(4096)
+
+                    if not raw:
+
+                        break
+
+                    payload, opcode = ws_decode_frame(raw)
+
+                    if opcode == 0x8:
+
+                        break
+
+                    if payload:
+
+                        msg = payload.decode("utf-8", errors="replace")
+
+                        WS.broadcast("[" + conn.id + "] " + msg)
+
+                except (ConnectionResetError, OSError):
+
+                    break
+
+        except Exception:
+
+            pass
+
+        finally:
+
+            if conn:
+
+                WS.remove(conn)
+
+
+
+    def _error_page(self, code, ctx):
+
+        titles = {400: "Requête invalide", 401: "Non authentifié",
+
+                  403: "Accès refusé", 404: "Introuvable",
+
+                  429: "Trop de requêtes", 500: "Erreur serveur"}
+
+        title = titles.get(code, "Erreur")
+
+        extra = ""
+
+        if code == 500 and ctx.get("error"):
+
+            extra = '<pre>' + esc(ctx.get("error")) + '</pre>'
+
+        return render(
+
+            '<div class="card" style="text-align:center;padding:60px 24px">'
+
+            '<h1 style="font-size:72px;color:#f85149">' + str(code) + '</h1>'
+
+            '<p style="font-size:18px;color:#7d8590">' + esc(title) + '</p>'
+
+            '<p style="color:#484f58;font-size:13px;margin-top:16px">'
+
+            'Path : <code>' + esc(ctx.get("path", "?")) + '</code></p>'
+
+            + extra +
+
+            '<a href="/" class="btn" style="margin-top:20px">Retour</a></div>',
+
+            ctx)
+
+
+
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+
+    daemon_threads = True
+
+    allow_reuse_address = True
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# MAIN
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+def main():
+
+    print()
+
+    print("╔" + "═" * 66 + "╗")
+
+    print("║  ⚡ NEXUS ROUTER v" + VERSION + " — LOCALHOST                    ║")
+
+    print("║  " + AUTEUR + " · " + LICENCE + "                    ║")
+
+    print("╚" + "═" * 66 + "╝")
+
+    print()
+
+    print("  Base       : " + str(BASE))
+
+    print("  DB         : " + str(DB_FILE))
+
+    print("  Cache      : " + str(CACHE_DIR))
+
+    print("  Routes     : " + str(len(ROUTER.routes)))
+
+    print("  Gzip       : " + ("actif" if ENABLE_GZIP else "off"))
+
+    print("  ETag       : " + ("actif" if ENABLE_ETAG else "off"))
+
+    print("  WebSocket  : " + ("actif" if ENABLE_WS else "off"))
+
+    print("  GraphQL    : " + ("actif" if ENABLE_GRAPHQL else "off"))
+
+    print("  RPS max    : " + str(RATE_LIMIT_PER_MIN) + "/min")
+
+    print()
+
+    print("  🌐 http://" + HOST + ":" + str(PORT) + "/")
+
+    print("  📡 SSE : http://" + HOST + ":" + str(PORT) + "/api/events/stream")
+
+    print("  🔌 WS  : ws://" + HOST + ":" + str(PORT) + "/ws/echo")
+
+    print("  📈 Prom: http://" + HOST + ":" + str(PORT) + "/metrics/prometheus")
+
+    print()
+
+    print("  Ctrl+C pour arrêter")
+
+    print()
+
+
+
+    try:
+
+        server = Server((HOST, PORT), Handler)
+
+        server.serve_forever()
+
+    except KeyboardInterrupt:
+
+        print("\n  Arrêté.")
+
+    except OSError as e:
+
+        print("  Erreur port " + str(PORT) + " : " + str(e))
+
+        sys.exit(1)
+
+
+
+
+
+if __name__ == "__main__":
+
+    try:
+
+        main()
+
+    except KeyboardInterrupt:
+
+        sys.exit(0)

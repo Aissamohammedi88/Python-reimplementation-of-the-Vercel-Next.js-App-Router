@@ -1,0 +1,1371 @@
+#!/usr/bin/env python3
+
+# -*- coding: utf-8 -*-
+
+"""
+
+NEXUS ROUTER — Python
+
+Reimplementation of modern SPA router logic.
+
+Inspired by Next.js App Router architecture, but own design.
+
+
+
+Components:
+
+  1. PrefetchPriority queue (Intent > Default > Background)
+
+  2. RouteCache with LRU + TTL
+
+  3. Navigation state machine
+
+  4. Cache-busting param generator (SHA-256)
+
+  5. Router with history + navigation hooks
+
+  6. Live HTTP server for testing
+
+"""
+
+import os
+
+import sys
+
+import json
+
+import time
+
+import heapq
+
+import hashlib
+
+import threading
+
+import http.server
+
+import socketserver
+
+from enum import IntEnum
+
+from pathlib import Path
+
+from datetime import datetime
+
+from collections import OrderedDict
+
+from urllib.parse import urlparse, parse_qs, urlencode
+
+
+
+# ============================================================
+
+# CONFIG
+
+# ============================================================
+
+PORT = 9100
+
+BASE = Path.cwd()
+
+DATA = BASE / "nexus_router_data"
+
+DATA.mkdir(parents=True, exist_ok=True)
+
+LOG = DATA / "router.log"
+
+
+
+G = "\033[92m"; Y = "\033[93m"; R = "\033[91m"; B = "\033[94m"; C = "\033[96m"; M = "\033[95m"; N = "\033[0m"
+
+
+
+
+
+def log(level, msg):
+
+    line = "[" + datetime.now().isoformat() + "] [" + level + "] " + msg
+
+    try:
+
+        with open(LOG, "a", encoding="utf-8") as f:
+
+            f.write(line + "\n")
+
+    except Exception:
+
+        pass
+
+    color = {"OK": G, "WARN": Y, "ERR": R, "INFO": B}.get(level, C)
+
+    print(color + "[" + level + "]" + N + " " + msg)
+
+
+
+
+
+# ============================================================
+
+# 1. PRIORITY — like Next.js PrefetchPriority
+
+# ============================================================
+
+class Priority(IntEnum):
+
+    BACKGROUND = 0
+
+    DEFAULT = 1
+
+    INTENT = 2
+
+
+
+
+
+# ============================================================
+
+# 2. PREFETCH QUEUE — priority heap
+
+# ============================================================
+
+class PrefetchQueue:
+
+    """Priority queue for prefetch tasks. Higher priority = dequeued first."""
+
+
+
+    def __init__(self):
+
+        self._heap = []
+
+        self._counter = 0
+
+        self._lock = threading.Lock()
+
+        self._inflight = 0
+
+        self._max_inflight = 8
+
+
+
+    def push(self, url, priority=Priority.DEFAULT, task=None):
+
+        with self._lock:
+
+            # Higher priority first, then FIFO
+
+            heapq.heappush(self._heap, (-int(priority), self._counter, url, task))
+
+            self._counter += 1
+
+
+
+    def pop(self):
+
+        with self._lock:
+
+            if not self._heap or self._inflight >= self._max_inflight:
+
+                return None
+
+            _, _, url, task = heapq.heappop(self._heap)
+
+            self._inflight += 1
+
+            return url, task
+
+
+
+    def done(self):
+
+        with self._lock:
+
+            if self._inflight > 0:
+
+                self._inflight -= 1
+
+
+
+    def size(self):
+
+        with self._lock:
+
+            return len(self._heap)
+
+
+
+
+
+# ============================================================
+
+# 3. CACHE LRU + TTL — like route cache
+
+# ============================================================
+
+class RouteCache:
+
+    """LRU cache with per-entry TTL."""
+
+
+
+    def __init__(self, max_size=200, default_ttl=300):
+
+        self.max_size = max_size
+
+        self.default_ttl = default_ttl
+
+        self._cache = OrderedDict()
+
+        self._lock = threading.RLock()
+
+        self._hits = 0
+
+        self._misses = 0
+
+        self._evictions = 0
+
+
+
+    def get(self, key):
+
+        with self._lock:
+
+            if key not in self._cache:
+
+                self._misses += 1
+
+                return None
+
+            value, stale_at = self._cache[key]
+
+            if time.time() > stale_at:
+
+                del self._cache[key]
+
+                self._misses += 1
+
+                return None
+
+            self._cache.move_to_end(key)
+
+            self._hits += 1
+
+            return value
+
+
+
+    def set(self, key, value, ttl=None):
+
+        ttl = ttl if ttl is not None else self.default_ttl
+
+        with self._lock:
+
+            self._cache[key] = (value, time.time() + ttl)
+
+            self._cache.move_to_end(key)
+
+            while len(self._cache) > self.max_size:
+
+                self._cache.popitem(last=False)
+
+                self._evictions += 1
+
+
+
+    def invalidate(self, key):
+
+        with self._lock:
+
+            if key in self._cache:
+
+                del self._cache[key]
+
+
+
+    def invalidate_all(self):
+
+        with self._lock:
+
+            self._cache.clear()
+
+
+
+    def stats(self):
+
+        with self._lock:
+
+            total = self._hits + self._misses
+
+            rate = (self._hits / total * 100) if total > 0 else 0
+
+            return {
+
+                "size": len(self._cache),
+
+                "max_size": self.max_size,
+
+                "hits": self._hits,
+
+                "misses": self._misses,
+
+                "evictions": self._evictions,
+
+                "hit_rate": round(rate, 2),
+
+            }
+
+
+
+
+
+# ============================================================
+
+# 4. CACHE BUSTING — SHA-256 based
+
+# ============================================================
+
+def compute_cache_busting_param(router_state, segment, next_url=""):
+
+    """Deterministic short hash from route state."""
+
+    payload = "|".join([str(router_state), str(segment), str(next_url)])
+
+    digest = hashlib.sha256(payload.encode()).digest()[:12]
+
+    import base64
+
+    return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+
+
+
+
+def set_cache_busting_search_param(url, param):
+
+    """Adds or replaces _rsc query param."""
+
+    parsed = urlparse(url)
+
+    qs = parse_qs(parsed.query)
+
+    qs["_rsc"] = [param]
+
+    new_query = urlencode(qs, doseq=True)
+
+    return parsed._replace(query=new_query).geturl()
+
+
+
+
+
+# ============================================================
+
+# 5. NAVIGATION STATE MACHINE
+
+# ============================================================
+
+class NavState:
+
+    IDLE = "idle"
+
+    PENDING = "pending"
+
+    SUCCESS = "success"
+
+    ERROR = "error"
+
+    MPA = "mpa"
+
+
+
+
+
+class Navigation:
+
+    """Represents a single navigation."""
+
+
+
+    _counter = 0
+
+
+
+    def __init__(self, url, kind="push"):
+
+        Navigation._counter += 1
+
+        self.id = "nav_" + str(Navigation._counter)
+
+        self.url = url
+
+        self.kind = kind  # push | replace | traverse | refresh
+
+        self.state = NavState.PENDING
+
+        self.started_at = time.time()
+
+        self.finished_at = None
+
+        self.result = None
+
+        self.error = None
+
+
+
+    def finish(self, result=None):
+
+        self.state = NavState.SUCCESS
+
+        self.finished_at = time.time()
+
+        self.result = result
+
+
+
+    def fail(self, error):
+
+        self.state = NavState.ERROR
+
+        self.finished_at = time.time()
+
+        self.error = error
+
+
+
+    def duration(self):
+
+        end = self.finished_at or time.time()
+
+        return round((end - self.started_at) * 1000, 2)
+
+
+
+    def to_dict(self):
+
+        return {
+
+            "id": self.id,
+
+            "url": self.url,
+
+            "kind": self.kind,
+
+            "state": self.state,
+
+            "duration_ms": self.duration(),
+
+            "error": self.error,
+
+        }
+
+
+
+
+
+# ============================================================
+
+# 6. ROUTER — main engine
+
+# ============================================================
+
+class Router:
+
+    """Client-side router with prefetch + cache + history."""
+
+
+
+    def __init__(self):
+
+        self.cache = RouteCache(max_size=200, default_ttl=300)
+
+        self.queue = PrefetchQueue()
+
+        self.history = []
+
+        self.current_url = "/"
+
+        self.listeners = []
+
+        self.navigation_log = []
+
+        self._lock = threading.RLock()
+
+        self._worker_running = False
+
+        self._worker_thread = None
+
+
+
+    # --------------------------------------------------------
+
+    # SUBSCRIPTION
+
+    # --------------------------------------------------------
+
+    def subscribe(self, callback):
+
+        """Subscribe to navigation events. callback(event_dict)."""
+
+        with self._lock:
+
+            self.listeners.append(callback)
+
+
+
+    def _emit(self, event):
+
+        with self._lock:
+
+            listeners = list(self.listeners)
+
+        for cb in listeners:
+
+            try:
+
+                cb(event)
+
+            except Exception as e:
+
+                log("ERR", "listener error: " + str(e))
+
+
+
+    # --------------------------------------------------------
+
+    # PREFETCH
+
+    # --------------------------------------------------------
+
+    def prefetch(self, url, priority=Priority.DEFAULT):
+
+        """Schedule a prefetch."""
+
+        if self.cache.get(url):
+
+            self._emit({"type": "prefetch_cache_hit", "url": url})
+
+            return
+
+        self.queue.push(url, priority)
+
+        self._emit({"type": "prefetch_scheduled", "url": url, "priority": int(priority)})
+
+        self._ensure_worker()
+
+
+
+    def _ensure_worker(self):
+
+        with self._lock:
+
+            if self._worker_running:
+
+                return
+
+            self._worker_running = True
+
+            self._worker_thread = threading.Thread(target=self._worker, daemon=True)
+
+            self._worker_thread.start()
+
+
+
+    def _worker(self):
+
+        """Background worker — processes prefetch queue."""
+
+        idle_ticks = 0
+
+        while True:
+
+            item = self.queue.pop()
+
+            if item is None:
+
+                idle_ticks += 1
+
+                if idle_ticks > 10 and self.queue.size() == 0:
+
+                    with self._lock:
+
+                        self._worker_running = False
+
+                    return
+
+                time.sleep(0.1)
+
+                continue
+
+            idle_ticks = 0
+
+            url, task = item
+
+            try:
+
+                data = self._fetch(url)
+
+                self.cache.set(url, data)
+
+                self._emit({"type": "prefetch_done", "url": url, "size": len(str(data))})
+
+            except Exception as e:
+
+                self._emit({"type": "prefetch_error", "url": url, "error": str(e)})
+
+            finally:
+
+                self.queue.done()
+
+
+
+    # --------------------------------------------------------
+
+    # FETCH (simulated payload)
+
+    # --------------------------------------------------------
+
+    def _fetch(self, url):
+
+        """Simulate fetching a route payload."""
+
+        time.sleep(0.05)  # simulate network
+
+        payload = {
+
+            "url": url,
+
+            "tree": self._build_tree(url),
+
+            "rendered_at": datetime.now().isoformat(),
+
+            "payload_id": hashlib.sha256(url.encode()).hexdigest()[:16],
+
+        }
+
+        return payload
+
+
+
+    def _build_tree(self, url):
+
+        """Build a route tree from URL."""
+
+        parts = [p for p in url.split("/") if p]
+
+        tree = {"segment": "/", "children": []}
+
+        current = tree
+
+        for part in parts:
+
+            node = {"segment": part, "children": []}
+
+            current["children"].append(node)
+
+            current = node
+
+        return tree
+
+
+
+    # --------------------------------------------------------
+
+    # NAVIGATE
+
+    # --------------------------------------------------------
+
+    def navigate(self, url, kind="push", use_prefetch=True):
+
+        """Navigate to a URL."""
+
+        nav = Navigation(url, kind)
+
+        self._emit({"type": "navigation_start", **nav.to_dict()})
+
+
+
+        try:
+
+            # Check cache first
+
+            cached = self.cache.get(url) if use_prefetch else None
+
+
+
+            if cached:
+
+                self._emit({"type": "navigation_cache_hit", "url": url})
+
+                data = cached
+
+            else:
+
+                # High priority prefetch for the target
+
+                self.prefetch(url, priority=Priority.INTENT)
+
+                data = self._fetch(url)
+
+                self.cache.set(url, data)
+
+
+
+            # Update state
+
+            if kind == "push":
+
+                self.history.append(self.current_url)
+
+            elif kind == "replace" and self.history:
+
+                self.history[-1] = self.current_url
+
+
+
+            self.current_url = url
+
+            nav.finish(result=data)
+
+
+
+        except Exception as e:
+
+            nav.fail(str(e))
+
+
+
+        self.navigation_log.append(nav.to_dict())
+
+        self._emit({"type": "navigation_end", **nav.to_dict()})
+
+        return nav
+
+
+
+    def back(self):
+
+        if self.history:
+
+            prev = self.history.pop()
+
+            self.navigate(prev, kind="traverse")
+
+            return prev
+
+        return None
+
+
+
+    def refresh(self):
+
+        self.cache.invalidate(self.current_url)
+
+        self.navigate(self.current_url, kind="refresh")
+
+
+
+    # --------------------------------------------------------
+
+    # STATUS
+
+    # --------------------------------------------------------
+
+    def status(self):
+
+        return {
+
+            "current_url": self.current_url,
+
+            "history_size": len(self.history),
+
+            "history": self.history[-10:],
+
+            "cache": self.cache.stats(),
+
+            "queue_size": self.queue.size(),
+
+            "navigations_total": len(self.navigation_log),
+
+            "recent_navigations": self.navigation_log[-5:],
+
+        }
+
+
+
+
+
+# ============================================================
+
+# 7. HTTP SERVER
+
+# ============================================================
+
+ROUTER = Router()
+
+
+
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+
+    def log_message(self, *args):
+
+        pass
+
+
+
+    def _json(self, data, code=200):
+
+        body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+
+        self.send_response(code)
+
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+
+        self.send_header("Content-Length", str(len(body)))
+
+        self.send_header("Access-Control-Allow-Origin", "*")
+
+        self.end_headers()
+
+        try:
+
+            self.wfile.write(body)
+
+        except Exception:
+
+            pass
+
+
+
+    def _html(self, content, code=200):
+
+        body = content.encode("utf-8")
+
+        self.send_response(code)
+
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+
+        self.send_header("Content-Length", str(len(body)))
+
+        self.end_headers()
+
+        try:
+
+            self.wfile.write(body)
+
+        except Exception:
+
+            pass
+
+
+
+    def do_GET(self):
+
+        p = urlparse(self.path)
+
+        path = p.path
+
+        qs = parse_qs(p.query)
+
+
+
+        if path in ("/", "/index.html"):
+
+            self._html(PAGE_HTML)
+
+        elif path == "/api/status":
+
+            self._json(ROUTER.status())
+
+        elif path == "/api/navigate":
+
+            url = qs.get("url", ["/"])[0]
+
+            kind = qs.get("kind", ["push"])[0]
+
+            nav = ROUTER.navigate(url, kind)
+
+            self._json(nav.to_dict())
+
+        elif path == "/api/prefetch":
+
+            url = qs.get("url", ["/"])[0]
+
+            prio = int(qs.get("priority", ["1"])[0])
+
+            ROUTER.prefetch(url, Priority(prio))
+
+            self._json({"status": "scheduled", "url": url, "priority": prio})
+
+        elif path == "/api/cache":
+
+            self._json(ROUTER.cache.stats())
+
+        elif path == "/api/history":
+
+            self._json({"history": ROUTER.history})
+
+        elif path == "/api/back":
+
+            prev = ROUTER.back()
+
+            self._json({"back_to": prev, "current": ROUTER.current_url})
+
+        elif path == "/api/refresh":
+
+            ROUTER.refresh()
+
+            self._json({"status": "refreshed", "url": ROUTER.current_url})
+
+        elif path == "/api/cache_bust":
+
+            state = qs.get("state", ["{}"])[0]
+
+            segment = qs.get("segment", ["children"])[0]
+
+            param = compute_cache_busting_param(state, segment)
+
+            self._json({"param": param})
+
+        else:
+
+            self._json({"error": "not_found", "path": path}, 404)
+
+
+
+    def do_POST(self):
+
+        p = urlparse(self.path)
+
+        path = p.path
+
+        try:
+
+            n = int(self.headers.get("Content-Length", 0))
+
+            body = json.loads(self.rfile.read(n).decode("utf-8")) if n > 0 else {}
+
+        except Exception:
+
+            body = {}
+
+
+
+        if path == "/api/navigate":
+
+            url = body.get("url", "/")
+
+            kind = body.get("kind", "push")
+
+            nav = ROUTER.navigate(url, kind)
+
+            self._json(nav.to_dict())
+
+        elif path == "/api/prefetch":
+
+            url = body.get("url", "/")
+
+            prio = body.get("priority", 1)
+
+            ROUTER.prefetch(url, Priority(prio))
+
+            self._json({"status": "scheduled"})
+
+        elif path == "/api/invalidate":
+
+            key = body.get("key")
+
+            if key:
+
+                ROUTER.cache.invalidate(key)
+
+            else:
+
+                ROUTER.cache.invalidate_all()
+
+            self._json({"status": "invalidated", "key": key or "all"})
+
+        else:
+
+            self._json({"error": "not_found"}, 404)
+
+
+
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+
+    daemon_threads = True
+
+    allow_reuse_address = True
+
+
+
+
+
+# ============================================================
+
+# 8. HTML PAGE — live dashboard
+
+# ============================================================
+
+PAGE_HTML = """<!DOCTYPE html>
+
+<html lang="en"><head><meta charset="UTF-8">
+
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<title>Nexus Router</title>
+
+<style>
+
+*{margin:0;padding:0;box-sizing:border-box}
+
+body{font-family:-apple-system,system-ui,sans-serif;background:#0a0014;color:#fff;padding:20px;min-height:100vh}
+
+.c{max-width:1100px;margin:0 auto}
+
+h1{color:#c8a45c;font-size:28px;margin-bottom:6px}
+
+.s{color:#888;font-size:12px;margin-bottom:20px}
+
+.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:20px}
+
+.st{background:#14001f;border:1px solid #2a1a3a;border-radius:10px;padding:14px;text-align:center}
+
+.st .n{font-size:22px;font-weight:700;color:#c8a45c;display:block}
+
+.st .l{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-top:4px;display:block}
+
+.b{background:#14001f;border:1px solid #2a1a3a;border-radius:10px;padding:18px;margin-bottom:14px}
+
+.b h2{color:#c8a45c;font-size:14px;margin-bottom:10px}
+
+input,textarea{width:100%;background:#0a0014;border:1px solid #2a1a3a;color:#4ade80;padding:10px;border-radius:6px;font-family:monospace;font-size:12px;margin-bottom:8px}
+
+button{background:#c8a45c;color:#000;border:none;padding:8px 16px;border-radius:999px;font-weight:600;cursor:pointer;margin-right:6px;font-size:12px}
+
+button.p{background:#4d6bfe;color:#fff}
+
+pre{background:#0a0014;padding:12px;border-radius:6px;overflow-x:auto;font-size:11px;color:#4ade80;max-height:280px;margin-top:8px}
+
+</style></head><body><div class="c">
+
+<h1>Nexus Router</h1>
+
+<p class="s">Python reimplementation of modern SPA routing</p>
+
+
+
+<div class="g" id="stats"></div>
+
+
+
+<div class="b"><h2>Navigate</h2>
+
+<input id="nav-url" value="/dashboard" placeholder="/path">
+
+<button onclick="navigate('push')">Push</button>
+
+<button class="p" onclick="navigate('replace')">Replace</button>
+
+<button onclick="prefetch()">Prefetch</button>
+
+<button onclick="back()">Back</button>
+
+<button onclick="refresh()">Refresh</button>
+
+<pre id="nav-out"></pre></div>
+
+
+
+<div class="b"><h2>Cache</h2>
+
+<button onclick="viewCache()">Show stats</button>
+
+<button onclick="invalidate()">Invalidate all</button>
+
+<pre id="cache-out"></pre></div>
+
+
+
+<div class="b"><h2>Status</h2>
+
+<button onclick="viewStatus()">Refresh</button>
+
+<pre id="status-out"></pre></div>
+
+
+
+</div>
+
+<script>
+
+async function loadStats(){
+
+  const r = await fetch('/api/status');
+
+  const d = await r.json();
+
+  const g = document.getElementById('stats');
+
+  g.innerHTML = '';
+
+  g.innerHTML += '<div class="st"><span class="n">' + d.navigations_total + '</span><span class="l">Navigations</span></div>';
+
+  g.innerHTML += '<div class="st"><span class="n">' + d.cache.hits + '</span><span class="l">Cache hits</span></div>';
+
+  g.innerHTML += '<div class="st"><span class="n">' + d.cache.misses + '</span><span class="l">Cache misses</span></div>';
+
+  g.innerHTML += '<div class="st"><span class="n">' + d.cache.hit_rate + '%</span><span class="l">Hit rate</span></div>';
+
+  g.innerHTML += '<div class="st"><span class="n">' + d.cache.size + '</span><span class="l">Cache size</span></div>';
+
+  g.innerHTML += '<div class="st"><span class="n">' + d.queue_size + '</span><span class="l">Queue</span></div>';
+
+}
+
+async function navigate(kind){
+
+  const url = document.getElementById('nav-url').value;
+
+  const r = await fetch('/api/navigate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url:url, kind:kind})});
+
+  const d = await r.json();
+
+  document.getElementById('nav-out').textContent = JSON.stringify(d, null, 2);
+
+  loadStats();
+
+}
+
+async function prefetch(){
+
+  const url = document.getElementById('nav-url').value;
+
+  const r = await fetch('/api/prefetch', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url:url, priority:2})});
+
+  const d = await r.json();
+
+  document.getElementById('nav-out').textContent = JSON.stringify(d, null, 2);
+
+  loadStats();
+
+}
+
+async function back(){
+
+  const r = await fetch('/api/back');
+
+  const d = await r.json();
+
+  document.getElementById('nav-out').textContent = JSON.stringify(d, null, 2);
+
+  loadStats();
+
+}
+
+async function refresh(){
+
+  const r = await fetch('/api/refresh');
+
+  const d = await r.json();
+
+  document.getElementById('nav-out').textContent = JSON.stringify(d, null, 2);
+
+  loadStats();
+
+}
+
+async function viewCache(){
+
+  const r = await fetch('/api/cache');
+
+  const d = await r.json();
+
+  document.getElementById('cache-out').textContent = JSON.stringify(d, null, 2);
+
+}
+
+async function invalidate(){
+
+  const r = await fetch('/api/invalidate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})});
+
+  const d = await r.json();
+
+  document.getElementById('cache-out').textContent = JSON.stringify(d, null, 2);
+
+}
+
+async function viewStatus(){
+
+  const r = await fetch('/api/status');
+
+  const d = await r.json();
+
+  document.getElementById('status-out').textContent = JSON.stringify(d, null, 2);
+
+}
+
+loadStats();
+
+setInterval(loadStats, 2000);
+
+</script></body></html>"""
+
+
+
+
+
+# ============================================================
+
+# 9. DEMO
+
+# ============================================================
+
+def demo():
+
+    """Run a demo of the router in terminal."""
+
+    print()
+
+    print(C + "=" * 70 + N)
+
+    print(C + "  NEXUS ROUTER — DEMO" + N)
+
+    print(C + "=" * 70 + N)
+
+
+
+    log("INFO", "Prefetching 3 routes with different priorities...")
+
+    ROUTER.prefetch("/home", Priority.BACKGROUND)
+
+    ROUTER.prefetch("/dashboard", Priority.INTENT)
+
+    ROUTER.prefetch("/settings", Priority.DEFAULT)
+
+
+
+    log("INFO", "Waiting for prefetch worker...")
+
+    time.sleep(1.5)
+
+
+
+    log("INFO", "Cache stats: " + json.dumps(ROUTER.cache.stats()))
+
+
+
+    log("INFO", "Navigating to /dashboard (should be cache hit)...")
+
+    nav = ROUTER.navigate("/dashboard")
+
+    print("  Navigation: " + json.dumps(nav.to_dict(), indent=2))
+
+
+
+    log("INFO", "Navigating to /profile (should be cache miss)...")
+
+    nav = ROUTER.navigate("/profile")
+
+    print("  Navigation: " + json.dumps(nav.to_dict(), indent=2))
+
+
+
+    log("INFO", "Going back...")
+
+    ROUTER.back()
+
+
+
+    log("INFO", "Final status:")
+
+    print(json.dumps(ROUTER.status(), indent=2, default=str))
+
+
+
+
+
+# ============================================================
+
+# MAIN
+
+# ============================================================
+
+def main():
+
+    print()
+
+    print(C + "=" * 70 + N)
+
+    print(C + "  NEXUS ROUTER — Python" + N)
+
+    print(C + "  Priority queue + LRU cache + state machine + HTTP server" + N)
+
+    print(C + "=" * 70 + N)
+
+
+
+    # CLI mode: demo
+
+    if len(sys.argv) > 1 and sys.argv[1] == "demo":
+
+        demo()
+
+        return
+
+
+
+    # Server mode
+
+    log("INFO", "Starting HTTP server on port " + str(PORT))
+
+    try:
+
+        with Server(("0.0.0.0", PORT), Handler) as httpd:
+
+            log("OK", "Listening: http://127.0.0.1:" + str(PORT) + "/")
+
+            log("INFO", "Endpoints:")
+
+            log("INFO", "  GET  /                  → Dashboard")
+
+            log("INFO", "  GET  /api/status        → Router status")
+
+            log("INFO", "  GET  /api/navigate?url= → Navigate")
+
+            log("INFO", "  GET  /api/prefetch?url= → Prefetch")
+
+            log("INFO", "  GET  /api/cache         → Cache stats")
+
+            log("INFO", "  GET  /api/back          → Go back")
+
+            log("INFO", "  GET  /api/refresh       → Refresh current")
+
+            log("INFO", "  POST /api/navigate      → Navigate (JSON)")
+
+            log("INFO", "  POST /api/prefetch      → Prefetch (JSON)")
+
+            log("INFO", "  POST /api/invalidate    → Invalidate cache")
+
+            print("")
+
+            httpd.serve_forever()
+
+    except KeyboardInterrupt:
+
+        log("INFO", "Stopped.")
+
+    except OSError as e:
+
+        log("ERR", "Port " + str(PORT) + " : " + str(e))
+
+
+
+
+
+if __name__ == "__main__":
+
+    main()

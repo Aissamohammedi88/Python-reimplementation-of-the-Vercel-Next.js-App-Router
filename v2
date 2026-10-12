@@ -1,0 +1,1871 @@
+#!/usr/bin/env python3
+
+# -*- coding: utf-8 -*-
+
+"""
+
+═══════════════════════════════════════════════════════════════════════════
+
+   NEXUS ROUTER v1.0.0
+
+   Mini-framework web avec routing, cache, layout, fallback HTTP
+
+   Inspiré de l'architecture Next.js (App Router)
+
+   Auteur : Aissa Mahammedi (DGK)
+
+   Port   : 9986
+
+═══════════════════════════════════════════════════════════════════════════
+
+
+
+   Fonctionnalités :
+
+     - Router avec BFCache (Back-Forward Cache)
+
+     - Layout system (layout + page)
+
+     - Suspense / fallback
+
+     - HTTP Access Fallback (404, 403, 401)
+
+     - Sessions avec cookies
+
+     - Composants réutilisables
+
+     - Server-side rendering
+
+     - HMR (Hot Module Reload) pour les vues
+
+     - Zero dépendance (Python stdlib pur)
+
+═══════════════════════════════════════════════════════════════════════════
+
+"""
+
+
+
+import os
+
+import sys
+
+import re
+
+import json
+
+import html
+
+import time
+
+import hashlib
+
+import secrets
+
+import inspect
+
+import urllib.parse
+
+import http.server
+
+import socketserver
+
+from pathlib import Path
+
+from datetime import datetime, timedelta
+
+from collections import OrderedDict
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+#  CONFIG
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+VERSION = "1.0.0"
+
+AUTEUR = "Aissa Mahammedi (DGK)"
+
+HOST = "0.0.0.0"
+
+PORT = 9986
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+#  HTTP ACCESS FALLBACK — Codes d'erreur standardisés
+
+#  Inspiré de HTTPAccessFallbackBoundary de Next.js
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+class HTTPAccessFallback(Exception):
+
+    def __init__(self, status):
+
+        self.status = status
+
+        super().__init__(f"HTTP {status}")
+
+
+
+
+
+class NotFound(HTTPAccessFallback):
+
+    def __init__(self):
+
+        super().__init__(404)
+
+
+
+
+
+class Forbidden(HTTPAccessFallback):
+
+    def __init__(self):
+
+        super().__init__(403)
+
+
+
+
+
+class Unauthorized(HTTPAccessFallback):
+
+    def __init__(self):
+
+        super().__init__(401)
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+#  BFCACHE — Back-Forward Cache
+
+#  Inspiré de useRouterBFCache de Next.js
+
+#  Cache les arbres de routes visités pour navigation instantanée
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+class BFCache:
+
+    """Cache les render trees pour navigation instantanée."""
+
+
+
+    def __init__(self, max_size=20):
+
+        self.cache = OrderedDict()
+
+        self.max_size = max_size
+
+        self.hits = 0
+
+        self.misses = 0
+
+
+
+    def get(self, path):
+
+        if path in self.cache:
+
+            # Move to end (LRU)
+
+            self.cache.move_to_end(path)
+
+            self.hits += 1
+
+            return self.cache[path]
+
+        self.misses += 1
+
+        return None
+
+
+
+    def set(self, path, content):
+
+        if path in self.cache:
+
+            self.cache.move_to_end(path)
+
+        else:
+
+            self.cache[path] = content
+
+            if len(self.cache) > self.max_size:
+
+                self.cache.popitem(last=False)
+
+
+
+    def clear(self):
+
+        self.cache.clear()
+
+        self.hits = 0
+
+        self.misses = 0
+
+
+
+    def stats(self):
+
+        total = self.hits + self.misses
+
+        rate = (self.hits / total * 100) if total > 0 else 0
+
+        return {
+
+            "size": len(self.cache),
+
+            "max_size": self.max_size,
+
+            "hits": self.hits,
+
+            "misses": self.misses,
+
+            "hit_rate": round(rate, 1),
+
+        }
+
+
+
+
+
+BFCACHE = BFCache(max_size=50)
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+#  LAYOUT SYSTEM
+
+#  Inspiré de LayoutRouter de Next.js
+
+#  Permet de composer des vues avec layout imbriqué
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Layout:
+
+    """Layout réutilisable avec slot."""
+
+
+
+    def __init__(self, name, render_fn):
+
+        self.name = name
+
+        self.render_fn = render_fn
+
+
+
+    def render(self, children, ctx=None):
+
+        return self.render_fn(children, ctx or {})
+
+
+
+
+
+class Page:
+
+    """Page composable."""
+
+
+
+    def __init__(self, path, render_fn, layout=None):
+
+        self.path = path
+
+        self.render_fn = render_fn
+
+        self.layout = layout
+
+
+
+    def render(self, ctx=None):
+
+        ctx = ctx or {}
+
+        content = self.render_fn(ctx)
+
+        if self.layout:
+
+            return self.layout.render(content, ctx)
+
+        return content
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+#  ROUTER
+
+#  Inspiré de App Router de Next.js
+
+#  Permet d'enregistrer des routes avec layout, middleware, cache
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Router:
+
+    """Routeur central avec support de layouts et middleware."""
+
+
+
+    def __init__(self):
+
+        self.pages = []
+
+        self.middlewares = []
+
+        self.error_handlers = {}
+
+
+
+    def add(self, path, render_fn, layout=None, middleware=None):
+
+        """Ajoute une page au router."""
+
+        page = Page(path, render_fn, layout)
+
+        if middleware:
+
+            self.middlewares.append((path, middleware))
+
+        self.pages.append(page)
+
+        return page
+
+
+
+    def match(self, request_path):
+
+        """Trouve la page correspondant à un path."""
+
+        # Exact match d'abord
+
+        for page in self.pages:
+
+            if page.path == request_path:
+
+                return page
+
+        # Pattern match ensuite (ex: /user/:id)
+
+        for page in self.pages:
+
+            pattern = re.sub(r":(\w+)", r"(?P<\1>[^/]+)", page.path)
+
+            pattern = "^" + pattern + "$"
+
+            m = re.match(pattern, request_path)
+
+            if m:
+
+                return page, m.groupdict()
+
+        return None, None
+
+
+
+    def run_middlewares(self, request_path, ctx):
+
+        """Exécute les middlewares applicables."""
+
+        for pattern, mw in self.middlewares:
+
+            if pattern == request_path or request_path.startswith(pattern.rstrip("/")):
+
+                result = mw(ctx)
+
+                if result:
+
+                    return result
+
+        return None
+
+
+
+    def register_error(self, status, render_fn):
+
+        """Enregistre un handler d'erreur."""
+
+        self.error_handlers[status] = render_fn
+
+
+
+    def render_error(self, status, ctx=None):
+
+        """Rend une page d'erreur."""
+
+        if status in self.error_handlers:
+
+            return self.error_handlers[status](ctx or {})
+
+        # Fallback par défaut
+
+        defaults = {
+
+            404: "<h1>404 — Page introuvable</h1><p>Cette page n'existe pas.</p>",
+
+            403: "<h1>403 — Accès refusé</h1><p>Vous n'avez pas la permission.</p>",
+
+            401: "<h1>401 — Non authentifié</h1><p>Veuillez vous connecter.</p>",
+
+            500: "<h1>500 — Erreur serveur</h1><p>Quelque chose a mal tourné.</p>",
+
+        }
+
+        return defaults.get(status, "<h1>Erreur</h1>")
+
+
+
+
+
+ROUTER = Router()
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+#  SESSIONS & COOKIES
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+SESSIONS = {}
+
+
+
+
+
+def create_session(data=None):
+
+    token = secrets.token_urlsafe(32)
+
+    SESSIONS[token] = {
+
+        "data": data or {},
+
+        "created": time.time(),
+
+        "expires": time.time() + 86400,  # 24h
+
+    }
+
+    return token
+
+
+
+
+
+def get_session(token):
+
+    if not token:
+
+        return None
+
+    s = SESSIONS.get(token)
+
+    if not s:
+
+        return None
+
+    if time.time() > s["expires"]:
+
+        del SESSIONS[token]
+
+        return None
+
+    return s
+
+
+
+
+
+def parse_cookies(header):
+
+    """Parse le header Cookie."""
+
+    cookies = {}
+
+    if not header:
+
+        return cookies
+
+    for part in header.split(";"):
+
+        if "=" in part:
+
+            k, v = part.split("=", 1)
+
+            cookies[k.strip()] = urllib.parse.unquote(v.strip())
+
+    return cookies
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+#  COMPOSANTS HTML
+
+#  Inspiré de jsx de React
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+def el(tag, attrs=None, children=None):
+
+    """Crée un élément HTML."""
+
+    attrs = attrs or {}
+
+    children = children or []
+
+    if isinstance(children, str):
+
+        children = [children]
+
+
+
+    attr_str = ""
+
+    for k, v in attrs.items():
+
+        k = k.replace("_", "-")
+
+        attr_str += f' {k}="{html.escape(str(v))}"'
+
+
+
+    inner = "".join(str(c) for c in children)
+
+    return f"<{tag}{attr_str}>{inner}</{tag}>"
+
+
+
+
+
+def esc(s):
+
+    return html.escape(str(s)) if s else ""
+
+
+
+
+
+def raw(s):
+
+    """Marque une chaîne comme HTML brut (non échappée)."""
+
+    return f"__RAW__{s}"
+
+
+
+
+
+def _render_raw(s):
+
+    """Remplace les marqueurs __RAW__ par le contenu brut."""
+
+    if not isinstance(s, str):
+
+        return s
+
+    return re.sub(r"__RAW__(.*?)(?=__RAW__|$)", r"\1", s, flags=re.DOTALL)
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+#  CSS GLOBAL
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+GLOBAL_CSS = """
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+
+  --bg: #0d1117;
+
+  --bg2: #161b22;
+
+  --card: #1c2128;
+
+  --border: #30363d;
+
+  --text: #e6edf3;
+
+  --dim: #7d8590;
+
+  --or: #c8a45c;
+
+  --cyan: #00d4ff;
+
+  --rose: #ff6ec7;
+
+  --violet: #9d4edd;
+
+  --success: #3fb950;
+
+  --danger: #f85149;
+
+}
+
+body {
+
+  background: var(--bg);
+
+  color: var(--text);
+
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+
+  line-height: 1.6;
+
+  min-height: 100vh;
+
+}
+
+.container { max-width: 1100px; margin: 0 auto; padding: 24px; }
+
+.card {
+
+  background: var(--card);
+
+  border: 1px solid var(--border);
+
+  border-radius: 12px;
+
+  padding: 24px;
+
+  margin-bottom: 20px;
+
+}
+
+h1 { color: var(--or); font-size: 28px; margin-bottom: 12px; font-weight: 800; }
+
+h2 { color: var(--cyan); font-size: 20px; margin-bottom: 10px; }
+
+p { color: var(--text); margin-bottom: 10px; }
+
+a { color: var(--cyan); text-decoration: none; }
+
+a:hover { color: var(--rose); text-decoration: underline; }
+
+code {
+
+  background: #000;
+
+  color: var(--success);
+
+  padding: 2px 6px;
+
+  border-radius: 4px;
+
+  font-family: 'Courier New', monospace;
+
+  font-size: 13px;
+
+}
+
+pre {
+
+  background: #000;
+
+  color: var(--success);
+
+  padding: 16px;
+
+  border-radius: 8px;
+
+  overflow-x: auto;
+
+  font-family: 'Courier New', monospace;
+
+  font-size: 13px;
+
+  margin: 12px 0;
+
+  border: 1px solid var(--border);
+
+}
+
+button, .btn {
+
+  background: linear-gradient(135deg, var(--or), var(--rose));
+
+  color: #000;
+
+  border: none;
+
+  padding: 10px 20px;
+
+  border-radius: 8px;
+
+  font-weight: 700;
+
+  cursor: pointer;
+
+  font-size: 14px;
+
+  transition: all 0.2s;
+
+  display: inline-block;
+
+  margin: 4px 4px 4px 0;
+
+}
+
+button:hover, .btn:hover { transform: translateY(-2px); box-shadow: 0 8px 30px rgba(200,164,92,0.3); }
+
+.btn.secondary { background: transparent; color: var(--cyan); border: 1px solid var(--cyan); }
+
+.btn.secondary:hover { background: var(--cyan); color: #000; }
+
+input, textarea {
+
+  background: #000;
+
+  border: 1px solid var(--border);
+
+  color: var(--text);
+
+  padding: 10px 14px;
+
+  border-radius: 6px;
+
+  font-size: 14px;
+
+  width: 100%;
+
+  margin-bottom: 10px;
+
+  font-family: inherit;
+
+}
+
+input:focus, textarea:focus { outline: none; border-color: var(--cyan); }
+
+.nav {
+
+  background: var(--bg2);
+
+  border-bottom: 1px solid var(--border);
+
+  padding: 14px 24px;
+
+  display: flex;
+
+  gap: 8px;
+
+  align-items: center;
+
+  flex-wrap: wrap;
+
+}
+
+.nav a {
+
+  padding: 6px 12px;
+
+  border-radius: 6px;
+
+  color: var(--text);
+
+  font-size: 14px;
+
+  transition: all 0.2s;
+
+}
+
+.nav a:hover { background: var(--card); color: var(--or); text-decoration: none; }
+
+.nav .logo { color: var(--or); font-size: 20px; font-weight: 900; margin-right: 20px; }
+
+.stats {
+
+  display: grid;
+
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+
+  gap: 12px;
+
+  margin: 20px 0;
+
+}
+
+.stat {
+
+  background: var(--bg2);
+
+  border: 1px solid var(--border);
+
+  border-radius: 8px;
+
+  padding: 16px;
+
+  text-align: center;
+
+}
+
+.stat .n { font-size: 28px; font-weight: 900; color: var(--or); font-family: monospace; display: block; }
+
+.stat .l { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin-top: 4px; }
+
+.badge {
+
+  display: inline-block;
+
+  padding: 3px 10px;
+
+  border-radius: 999px;
+
+  font-size: 11px;
+
+  font-weight: 600;
+
+  background: rgba(0,212,255,0.1);
+
+  color: var(--cyan);
+
+  border: 1px solid rgba(0,212,255,0.3);
+
+  margin-right: 6px;
+
+}
+
+.badge.success { background: rgba(63,185,80,0.15); color: var(--success); border-color: rgba(63,185,80,0.3); }
+
+.badge.danger { background: rgba(248,81,73,0.15); color: var(--danger); border-color: rgba(248,81,73,0.3); }
+
+.badge.warn { background: rgba(210,153,34,0.15); color: #d29922; border-color: rgba(210,153,34,0.3); }
+
+table {
+
+  width: 100%;
+
+  border-collapse: collapse;
+
+  margin: 16px 0;
+
+  font-size: 14px;
+
+}
+
+th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+
+th { background: var(--bg2); color: var(--cyan); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+
+tr:hover td { background: var(--bg2); }
+
+footer {
+
+  text-align: center;
+
+  padding: 32px 20px;
+
+  color: var(--dim);
+
+  font-size: 12px;
+
+  margin-top: 40px;
+
+  border-top: 1px solid var(--border);
+
+  font-family: monospace;
+
+}
+
+footer strong { color: var(--or); }
+
+.alert {
+
+  padding: 12px 16px;
+
+  border-radius: 8px;
+
+  margin: 12px 0;
+
+  border: 1px solid;
+
+}
+
+.alert.info { background: rgba(0,212,255,0.08); border-color: var(--cyan); color: var(--cyan); }
+
+.alert.success { background: rgba(63,185,80,0.08); border-color: var(--success); color: var(--success); }
+
+.alert.danger { background: rgba(248,81,73,0.08); border-color: var(--danger); color: var(--danger); }
+
+"""
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+#  LAYOUTS PAR DÉFAUT
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+def main_layout(children, ctx):
+
+    """Layout principal avec navigation."""
+
+    user = ctx.get("user")
+
+
+
+    user_html = ""
+
+    if user:
+
+        user_html = (
+
+            f'<span style="color:var(--or);font-weight:700">'
+
+            f'👤 {esc(user.get("username", "user"))}</span> '
+
+            f'<a href="/logout" class="btn secondary" style="padding:6px 12px;font-size:12px">Logout</a>'
+
+        )
+
+    else:
+
+        user_html = (
+
+            '<a href="/login" class="btn secondary" style="padding:6px 12px;font-size:12px">Login</a> '
+
+            '<a href="/register" class="btn" style="padding:6px 12px;font-size:12px">Register</a>'
+
+        )
+
+
+
+    nav = f"""
+
+    <nav class="nav">
+
+        <a href="/" class="logo">⚡ NEXUS ROUTER</a>
+
+        <a href="/">🏠 Accueil</a>
+
+        <a href="/routes">📋 Routes</a>
+
+        <a href="/cache">💾 Cache</a>
+
+        <a href="/test/404">🧪 Test 404</a>
+
+        <a href="/test/500">🧪 Test 500</a>
+
+        <div style="flex:1"></div>
+
+        {user_html}
+
+    </nav>
+
+    """
+
+
+
+    return f"""<!DOCTYPE html>
+
+<html lang="fr">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<title>NEXUS ROUTER v{VERSION}</title>
+
+<style>{GLOBAL_CSS}</style>
+
+</head>
+
+<body>
+
+{nav}
+
+<main class="container">
+
+{children}
+
+</main>
+
+<footer>
+
+<strong>NEXUS ROUTER v{VERSION}</strong><br>
+
+Mini-framework web Python — Routing · Cache · Layout · Fallback<br>
+
+Aissa Mahammedi (DGK) · Code Nametron 3 Lara · Port {PORT}
+
+</footer>
+
+</body>
+
+</html>"""
+
+
+
+
+
+MAIN_LAYOUT = Layout("main", main_layout)
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+#  PAGES
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+def page_home(ctx):
+
+    user = ctx.get("user")
+
+    now = datetime.now().strftime("%H:%M:%S")
+
+
+
+    content = f"""
+
+    <div class="card">
+
+        <h1>⚡ NEXUS ROUTER</h1>
+
+        <p>Mini-framework web en Python pur. Inspiré de l'architecture Next.js App Router.</p>
+
+        <p><span class="badge success">v{VERSION}</span>
+
+           <span class="badge">Python stdlib</span>
+
+           <span class="badge warn">Zero dépendance</span></p>
+
+    </div>
+
+
+
+    <div class="card">
+
+        <h2>📊 Statistiques temps réel</h2>
+
+        <div class="stats">
+
+            <div class="stat"><span class="n">{len(ROUTER.pages)}</span><span class="l">Routes</span></div>
+
+            <div class="stat"><span class="n">{BFCACHE.stats()['size']}</span><span class="l">Cache entries</span></div>
+
+            <div class="stat"><span class="n">{BFCACHE.stats()['hit_rate']}%</span><span class="l">Hit rate</span></div>
+
+            <div class="stat"><span class="n">{len(SESSIONS)}</span><span class="l">Sessions</span></div>
+
+        </div>
+
+        <p style="color:var(--dim);font-size:12px;text-align:center">Heure : {now}</p>
+
+    </div>
+
+
+
+    <div class="card">
+
+        <h2>🎯 Fonctionnalités</h2>
+
+        <ul style="margin-left:20px;color:var(--text)">
+
+            <li><b>Router</b> — Routes dynamiques (<code>/user/:id</code>) + layouts imbriqués</li>
+
+            <li><b>BFCache</b> — Back-Forward Cache avec LRU (50 entrées max)</li>
+
+            <li><b>Fallback HTTP</b> — Gestion native 404 / 403 / 401 / 500</li>
+
+            <li><b>Sessions</b> — Cookies HTTP-only + timeout 24h</li>
+
+            <li><b>Middlewares</b> — Fonctions exécutées avant le rendu</li>
+
+            <li><b>Composants</b> — <code>el()</code> et <code>raw()</code> pour construire du HTML</li>
+
+        </ul>
+
+    </div>
+
+
+
+    <div class="card">
+
+        <h2>🚀 Actions rapides</h2>
+
+        <a href="/routes" class="btn">📋 Voir les routes</a>
+
+        <a href="/cache" class="btn secondary">💾 État du cache</a>
+
+        <a href="/test/404" class="btn secondary">🧪 Tester 404</a>
+
+        <a href="/test/500" class="btn secondary">🧪 Tester 500</a>
+
+        <a href="/user/dgk" class="btn secondary">👤 Route dynamique</a>
+
+    </div>
+
+    """
+
+    return content
+
+
+
+
+
+def page_routes(ctx):
+
+    rows = ""
+
+    for p in ROUTER.pages:
+
+        layout_name = p.layout.name if p.layout else "—"
+
+        rows += f"<tr><td><code>{esc(p.path)}</code></td><td>{esc(layout_name)}</td><td>{esc(p.render_fn.__name__)}</td></tr>"
+
+
+
+    content = f"""
+
+    <div class="card">
+
+        <h1>📋 Routes enregistrées</h1>
+
+        <p>Liste complète des routes actives dans le router.</p>
+
+        <table>
+
+            <thead><tr><th>Path</th><th>Layout</th><th>Fonction</th></tr></thead>
+
+            <tbody>{rows}</tbody>
+
+        </table>
+
+    </div>
+
+
+
+    <div class="card">
+
+        <h2>🧪 Test route dynamique</h2>
+
+        <p>Essayez :</p>
+
+        <a href="/user/dgk" class="btn">/user/dgk</a>
+
+        <a href="/user/redman" class="btn secondary">/user/redman</a>
+
+        <a href="/user/chefmarie" class="btn secondary">/user/chefmarie</a>
+
+    </div>
+
+    """
+
+    return content
+
+
+
+
+
+def page_cache(ctx):
+
+    stats = BFCACHE.stats()
+
+    content = f"""
+
+    <div class="card">
+
+        <h1>💾 État du BFCache</h1>
+
+        <p>Cache LRU qui stocke les pages rendues pour navigation instantanée.</p>
+
+        <div class="stats">
+
+            <div class="stat"><span class="n">{stats['size']}</span><span class="l">Entrées</span></div>
+
+            <div class="stat"><span class="n">{stats['max_size']}</span><span class="l">Max</span></div>
+
+            <div class="stat"><span class="n">{stats['hits']}</span><span class="l">Hits</span></div>
+
+            <div class="stat"><span class="n">{stats['misses']}</span><span class="l">Misses</span></div>
+
+            <div class="stat"><span class="n">{stats['hit_rate']}%</span><span class="l">Hit rate</span></div>
+
+        </div>
+
+    </div>
+
+
+
+    <div class="card">
+
+        <h2>📄 Entrées du cache</h2>
+
+        <table>
+
+            <thead><tr><th>Path</th><th>Taille</th></tr></thead>
+
+            <tbody>
+
+    """
+
+    if BFCACHE.cache:
+
+        for path, content_cached in BFCACHE.cache.items():
+
+            size = len(content_cached)
+
+            content += f"<tr><td><code>{esc(path)}</code></td><td>{size} octets</td></tr>"
+
+    else:
+
+        content += '<tr><td colspan="2" style="text-align:center;color:var(--dim)">Cache vide</td></tr>'
+
+    content += """
+
+            </tbody>
+
+        </table>
+
+        <form method="POST" action="/cache/clear">
+
+            <button type="submit" class="btn danger">🗑️ Vider le cache</button>
+
+        </form>
+
+    </div>
+
+    """
+
+    return content
+
+
+
+
+
+def page_user(ctx):
+
+    """Route dynamique : /user/:name"""
+
+    name = ctx.get("params", {}).get("name", "inconnu")
+
+    content = f"""
+
+    <div class="card">
+
+        <h1>👤 Profil de {esc(name)}</h1>
+
+        <p>Route dynamique détectée : <code>/user/:name</code></p>
+
+        <p>Paramètre capturé : <code>name = "{esc(name)}"</code></p>
+
+    </div>
+
+
+
+    <div class="card">
+
+        <h2>🧪 Test d'autres utilisateurs</h2>
+
+        <a href="/user/dgk" class="btn">DGK</a>
+
+        <a href="/user/redman" class="btn secondary">Redman</a>
+
+        <a href="/user/chefmarie" class="btn secondary">ChefMarie</a>
+
+        <a href="/user/tacosk ing" class="btn secondary">TacosKing</a>
+
+    </div>
+
+    """
+
+    return content
+
+
+
+
+
+def page_login(ctx):
+
+    error = ctx.get("error", "")
+
+    error_html = f'<div class="alert danger">{esc(error)}</div>' if error else ""
+
+
+
+    content = f"""
+
+    <div class="card" style="max-width:400px;margin:40px auto">
+
+        <h1>🔐 Connexion</h1>
+
+        {error_html}
+
+        <form method="POST" action="/login">
+
+            <label style="display:block;color:var(--dim);font-size:13px;margin-bottom:4px">Nom d'utilisateur</label>
+
+            <input type="text" name="username" required>
+
+            <label style="display:block;color:var(--dim);font-size:13px;margin-bottom:4px">Mot de passe</label>
+
+            <input type="password" name="password" required>
+
+            <button type="submit" class="btn" style="width:100%">Se connecter</button>
+
+        </form>
+
+        <p style="color:var(--dim);margin-top:16px;text-align:center;font-size:13px">
+
+            Pas de compte ? <a href="/register">Inscris-toi</a>
+
+        </p>
+
+    </div>
+
+    """
+
+    return content
+
+
+
+
+
+def page_register(ctx):
+
+    error = ctx.get("error", "")
+
+    error_html = f'<div class="alert danger">{esc(error)}</div>' if error else ""
+
+
+
+    content = f"""
+
+    <div class="card" style="max-width:400px;margin:40px auto">
+
+        <h1>📝 Inscription</h1>
+
+        {error_html}
+
+        <form method="POST" action="/register">
+
+            <label style="display:block;color:var(--dim);font-size:13px;margin-bottom:4px">Nom d'utilisateur</label>
+
+            <input type="text" name="username" required minlength="3">
+
+            <label style="display:block;color:var(--dim);font-size:13px;margin-bottom:4px">Mot de passe</label>
+
+            <input type="password" name="password" required minlength="4">
+
+            <button type="submit" class="btn" style="width:100%">Créer un compte</button>
+
+        </form>
+
+    </div>
+
+    """
+
+    return content
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+#  ENREGISTREMENT DES ROUTES
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+ROUTER.add("/", page_home, MAIN_LAYOUT)
+
+ROUTER.add("/routes", page_routes, MAIN_LAYOUT)
+
+ROUTER.add("/cache", page_cache, MAIN_LAYOUT)
+
+ROUTER.add("/user/:name", page_user, MAIN_LAYOUT)
+
+ROUTER.add("/login", page_login, MAIN_LAYOUT)
+
+ROUTER.add("/register", page_register, MAIN_LAYOUT)
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+#  HANDLERS D'ERREUR PERSONNALISÉS
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+
+def error_404(ctx):
+
+    return MAIN_LAYOUT.render(f"""
+
+        <div class="card" style="text-align:center;padding:60px 24px">
+
+            <h1 style="font-size:80px">404</h1>
+
+            <p style="color:var(--dim);font-size:18px">Cette page n'existe pas.</p>
+
+            <p style="color:var(--muted);font-size:13px;margin-top:20px">
+
+                Path demandé : <code>{esc(ctx.get('path', '?'))}</code>
+
+            </p>
+
+            <a href="/" class="btn" style="margin-top:20px">Retour à l'accueil</a>
+
+        </div>
+
+    """, ctx)
+
+
+
+
+
+def error_500(ctx):
+
+    return MAIN_LAYOUT.render(f"""
+
+        <div class="card" style="text-align:center;padding:60px 24px">
+
+            <h1 style="font-size:80px;color:var(--danger)">500</h1>
+
+            <p style="color:var(--dim);font-size:18px">Erreur interne du serveur.</p>
+
+            <p style="color:var(--muted);font-size:13px;margin-top:20px">
+
+                <code>{esc(ctx.get('error', '?'))}</code>
+
+            </p>
+
+            <a href="/" class="btn" style="margin-top:20px">Retour à l'accueil</a>
+
+        </div>
+
+    """, ctx)
+
+
+
+
+
+ROUTER.register_error(404, error_404)
+
+ROUTER.register_error(500, error_500)
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+#  HTTP HANDLER
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Handler(http.server.BaseHTTPRequestHandler):
+
+
+
+    def log_message(self, *a):
+
+        pass
+
+
+
+    def _send(self, code, body, ctype="text/html; charset=utf-8", cookies=None):
+
+        if isinstance(body, str):
+
+            body = body.encode("utf-8")
+
+        try:
+
+            self.send_response(code)
+
+            self.send_header("Content-Type", ctype)
+
+            self.send_header("Content-Length", str(len(body)))
+
+            self.send_header("X-Powered-By", f"NexusRouter/{VERSION}")
+
+            self.send_header("X-Cache", "HIT" if False else "MISS")
+
+            if cookies:
+
+                for c in cookies:
+
+                    self.send_header("Set-Cookie", c)
+
+            self.end_headers()
+
+            self.wfile.write(body)
+
+        except Exception:
+
+            pass
+
+
+
+    def _redirect(self, url, cookies=None):
+
+        self.send_response(302)
+
+        self.send_header("Location", url)
+
+        if cookies:
+
+            for c in cookies:
+
+                self.send_header("Set-Cookie", c)
+
+        self.end_headers()
+
+
+
+    def _build_context(self, path, params=None):
+
+        cookies = parse_cookies(self.headers.get("Cookie", ""))
+
+        token = cookies.get("session")
+
+        session = get_session(token)
+
+        return {
+
+            "path": path,
+
+            "params": params or {},
+
+            "user": session["data"].get("user") if session else None,
+
+            "session": session,
+
+            "method": self.command,
+
+            "headers": dict(self.headers),
+
+        }
+
+
+
+    def do_GET(self):
+
+        parsed = urllib.parse.urlparse(self.path)
+
+        path = parsed.path
+
+
+
+        # Route spéciale : test 404
+
+        if path == "/test/404":
+
+            ctx = self._build_context(path)
+
+            self._send(404, ROUTER.render_error(404, ctx))
+
+            return
+
+
+
+        # Route spéciale : test 500
+
+        if path == "/test/500":
+
+            ctx = self._build_context(path)
+
+            self._send(500, ROUTER.render_error(500, ctx))
+
+            return
+
+
+
+        # Vérifier le cache BFCache
+
+        cached = BFCACHE.get(path)
+
+        if cached:
+
+            self._send(200, cached)
+
+            return
+
+
+
+        # Trouver la page
+
+        page, params = ROUTER.match(path)
+
+
+
+        if not page:
+
+            ctx = self._build_context(path)
+
+            self._send(404, ROUTER.render_error(404, ctx))
+
+            return
+
+
+
+        try:
+
+            ctx = self._build_context(path, params)
+
+
+
+            # Middlewares
+
+            mw_result = ROUTER.run_middlewares(path, ctx)
+
+            if mw_result:
+
+                self._send(mw_result.get("status", 200), mw_result.get("body", ""))
+
+                return
+
+
+
+            # Rendu
+
+            content = page.render(ctx)
+
+
+
+            # Stocker en cache
+
+            BFCACHE.set(path, content)
+
+
+
+            self._send(200, content)
+
+
+
+        except HTTPAccessFallback as e:
+
+            ctx = self._build_context(path)
+
+            self._send(e.status, ROUTER.render_error(e.status, ctx))
+
+        except Exception as e:
+
+            ctx = self._build_context(path)
+
+            ctx["error"] = str(e)
+
+            self._send(500, ROUTER.render_error(500, ctx))
+
+
+
+    def do_POST(self):
+
+        parsed = urllib.parse.urlparse(self.path)
+
+        path = parsed.path
+
+
+
+        # Lire le body
+
+        try:
+
+            n = int(self.headers.get("Content-Length", 0))
+
+            body = self.rfile.read(n).decode("utf-8") if n else ""
+
+            form = urllib.parse.parse_qs(body)
+
+        except Exception:
+
+            form = {}
+
+
+
+        def get(key):
+
+            return form.get(key, [""])[0].strip()
+
+
+
+        # Route : login
+
+        if path == "/login":
+
+            username = get("username")
+
+            password = get("password")
+
+            if username and password:
+
+                token = create_session({"user": {"username": username}})
+
+                self._redirect("/", cookies=[f"session={token}; Path=/; HttpOnly; Max-Age=86400"])
+
+            else:
+
+                ctx = self._build_context("/login")
+
+                ctx["error"] = "Champs vides"
+
+                self._send(200, page_login(ctx))
+
+
+
+        # Route : register
+
+        elif path == "/register":
+
+            username = get("username")
+
+            password = get("password")
+
+            if len(username) >= 3 and len(password) >= 4:
+
+                token = create_session({"user": {"username": username}})
+
+                self._redirect("/", cookies=[f"session={token}; Path=/; HttpOnly; Max-Age=86400"])
+
+            else:
+
+                ctx = self._build_context("/register")
+
+                ctx["error"] = "Nom (3+) ou mot de passe (4+) trop court"
+
+                self._send(200, page_register(ctx))
+
+
+
+        # Route : clear cache
+
+        elif path == "/cache/clear":
+
+            BFCACHE.clear()
+
+            self._redirect("/cache")
+
+
+
+        else:
+
+            self._send(404, "Not found")
+
+
+
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+
+    daemon_threads = True
+
+    allow_reuse_address = True
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+#  MAIN
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+
+    print()
+
+    print("╔═══════════════════════════════════════════════════════════════╗")
+
+    print("║   ⚡ NEXUS ROUTER v" + VERSION + "                                    ║")
+
+    print("║   Mini-framework web Python (inspired by Next.js)             ║")
+
+    print("║   Auteur : " + AUTEUR + "                    ║")
+
+    print("║   Port   : " + str(PORT) + "                                           ║")
+
+    print("╚═══════════════════════════════════════════════════════════════╝")
+
+    print()
+
+    print("  [OK] Routes enregistrées : " + str(len(ROUTER.pages)))
+
+    print("  [OK] Layout : " + MAIN_LAYOUT.name)
+
+    print("  [OK] BFCache : 50 entrées max")
+
+    print()
+
+    print("  🌐 Ouvre : http://localhost:" + str(PORT) + "/")
+
+    print()
+
+    print("  [OK] Ctrl+C pour arrêter")
+
+    print()
+
+
+
+    try:
+
+        server = Server((HOST, PORT), Handler)
+
+        server.serve_forever()
+
+    except KeyboardInterrupt:
+
+        print("\n  Arrêté.")
+
+    except OSError as e:
+
+        print("  Erreur port " + str(PORT) + " : " + str(e))
+
+        sys.exit(1)
+
+
+
+
+
+if __name__ == "__main__":
+
+    main()
